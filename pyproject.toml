@@ -8,6 +8,9 @@ authors = [
 ]
 license = "LGPL-3.0-only"
 
+[project.urls]
+Repository = "https://github.com/SigmaHQ/pySigma-backend-sqlite"
+
 [tool.poetry]
 packages = [
     { include = "sigma" }
@@ -15,7 +18,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = "^3.9"
-pysigma = "^0.11.17"
+pysigma = "1.0.0rc2"
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.1"
@@ -23,21 +26,6 @@ pytest = "^8.0"
 pytest-cov = "^4.1"
 coverage = "^7.4"
 
-
-[tool.pdm]
-[tool.pdm.dev-dependencies]
-dev = []
-
-[tool.pdm.build]
-includes = ["sigma"]
 [build-system]
-requires = ["poetry-core>=1.8.1"]
+requires = ["poetry-core>=2.1.0"]
 build-backend = "poetry.core.masonry.api"
-
-[project.urls]
-Repository = "https://github.com/SigmaHQ/pySigma-backend-sqlite"
-
-[project.group.dev.dependencies]
-pytest = "^8.0"
-pytest-cov = "^4.1"
-coverage = "^7.4"
