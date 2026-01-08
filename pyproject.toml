@@ -1,6 +1,6 @@
 [project]
 name = "pySigma-backend-sqlite"
-version = "0.2.0"
+version = "1.0.0"
 description = "pySigma sqlite backend"
 readme = "README.md"
 authors = [
@@ -49,4 +49,5 @@ Repository = "https://github.com/SigmaHQ/pySigma-backend-sqlite"
 pytest = "^8.0"
 pytest-cov = "^4.1"
 coverage = "^7.4"
+
 
