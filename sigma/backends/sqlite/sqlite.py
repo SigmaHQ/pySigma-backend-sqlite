@@ -15,8 +15,13 @@ from sigma.types import (
     SigmaCompareExpression,
     SigmaString,
     SpecialChars,
-    SigmaRegularExpressionFlag,
     SigmaCIDRExpression,
+    TimestampPart,
+)
+from sigma.correlations import (
+    SigmaCorrelationConditionOperator,
+    SigmaCorrelationRule,
+    SigmaCorrelationTypeLiteral,
 )
 
 import re
@@ -37,6 +42,11 @@ class sqliteBackend(TextQueryBackend):
     requires_pipeline: bool = (
         False  # TODO: does the backend requires that a processing pipeline is provided? This information can be used by user interface programs like Sigma CLI to warn users about inappropriate usage of the backend.
     )
+
+    # Correlation support
+    correlation_methods: ClassVar[Dict[str, str]] = {
+        "default": "Default SQLite correlation using subqueries and window functions",
+    }
 
     precedence: ClassVar[Tuple[ConditionItem, ConditionItem, ConditionItem]] = (
         ConditionNOT,
@@ -148,14 +158,34 @@ class sqliteBackend(TextQueryBackend):
         SigmaCompareExpression.CompareOperators.GTE: ">=",
     }
 
-    # Expression for comparing two event fields
-    field_equals_field_expression: ClassVar[Optional[str]] = (
-        None  # Field comparison expression with the placeholders {field1} and {field2} corresponding to left field and right value side of Sigma detection item
+    # Expression for comparing two event fields (fieldref modifier)
+    field_equals_field_expression: ClassVar[Optional[str]] = "{field1}={field2}"
+    field_equals_field_startswith_expression: ClassVar[Optional[str]] = (
+        "{field1} LIKE {field2} || '%' ESCAPE '\\'"
+    )
+    field_equals_field_endswith_expression: ClassVar[Optional[str]] = (
+        "{field1} LIKE '%' || {field2} ESCAPE '\\'"
+    )
+    field_equals_field_contains_expression: ClassVar[Optional[str]] = (
+        "{field1} LIKE '%' || {field2} || '%' ESCAPE '\\'"
     )
     field_equals_field_escaping_quoting: Tuple[bool, bool] = (
         True,
         True,
-    )  # If regular field-escaping/quoting is applied to field1 and field2. A custom escaping/quoting can be implemented in the convert_condition_field_eq_field_escape_and_quote method.
+    )  # If regular field-escaping/quoting is applied to field1 and field2.
+
+    # Timestamp part expressions for time modifiers (|minute, |hour, |day, etc.)
+    field_timestamp_part_expression: ClassVar[Optional[str]] = (
+        "CAST(strftime('{timestamp_part}', {field}) AS INTEGER)"
+    )
+    timestamp_part_mapping: ClassVar[Optional[Dict[TimestampPart, str]]] = {
+        TimestampPart.MINUTE: "%M",
+        TimestampPart.HOUR: "%H",
+        TimestampPart.DAY: "%d",
+        TimestampPart.WEEK: "%W",
+        TimestampPart.MONTH: "%m",
+        TimestampPart.YEAR: "%Y",
+    }
 
     # Null/None expressions
     field_null_expression: ClassVar[str] = (
@@ -198,7 +228,216 @@ class sqliteBackend(TextQueryBackend):
         ""  # String used as query if final query only contains deferred expression
     )
 
+    # ========== Correlation Rule Templates ==========
+    # SQLite correlation queries use window functions and subqueries
+
+    # Correlation search expressions
+    # For single rule, build a SELECT query with the condition
+    correlation_search_single_rule_expression: ClassVar[Optional[str]] = (
+        "SELECT * FROM logs WHERE {query}{normalization}"
+    )
+    correlation_search_multi_rule_expression: ClassVar[Optional[str]] = "{queries}"
+    correlation_search_multi_rule_query_expression: ClassVar[Optional[str]] = (
+        "SELECT *, '{ruleid}' AS sigma_rule_id FROM logs WHERE {query}{normalization}"
+    )
+    correlation_search_multi_rule_query_expression_joiner: ClassVar[Optional[str]] = " UNION ALL "
+
+    # Field normalization for aliases
+    correlation_search_field_normalization_expression: ClassVar[Optional[str]] = (
+        "{field} AS {alias}"
+    )
+    correlation_search_field_normalization_expression_joiner: ClassVar[Optional[str]] = ", "
+
+    # Timespan is converted to seconds for SQLite
+    timespan_seconds: ClassVar[bool] = True
+
+    # Group by expressions
+    groupby_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": " GROUP BY {fields}",
+    }
+    groupby_field_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "{field}",
+    }
+    groupby_field_expression_joiner: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", ",
+    }
+    groupby_expression_nofield: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "",
+    }
+
+    # Event count correlation
+    # Use {select_fields} placeholder which will be either "*" (no group by) or the group by fields
+    event_count_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition}",
+    }
+    event_count_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", COUNT(*) AS event_count",
+    }
+    event_count_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "event_count {op} {count}",
+    }
+
+    # Value count correlation
+    value_count_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition}",
+    }
+    value_count_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", COUNT(DISTINCT {field}) AS value_count",
+    }
+    value_count_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "value_count {op} {count}",
+    }
+
+    # Temporal correlation
+    temporal_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition} AND (julianday(last_event) - julianday(first_event)) * 86400 <= {timespan}",
+    }
+    temporal_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", COUNT(DISTINCT sigma_rule_id) AS rule_count, MIN(timestamp) AS first_event, MAX(timestamp) AS last_event",
+    }
+    temporal_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "rule_count {op} {count}",
+    }
+
+    # Temporal ordered correlation
+    temporal_ordered_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition} AND (julianday(last_event) - julianday(first_event)) * 86400 <= {timespan}",
+    }
+    temporal_ordered_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", GROUP_CONCAT(sigma_rule_id ORDER BY timestamp) AS rule_sequence, COUNT(DISTINCT sigma_rule_id) AS rule_count, MIN(timestamp) AS first_event, MAX(timestamp) AS last_event",
+    }
+    temporal_ordered_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "rule_count {op} {count}",
+    }
+
+    # Value sum correlation
+    value_sum_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition}",
+    }
+    value_sum_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", SUM({field}) AS value_sum",
+    }
+    value_sum_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "value_sum {op} {count}",
+    }
+
+    # Value avg correlation
+    value_avg_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition}",
+    }
+    value_avg_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", AVG({field}) AS value_avg",
+    }
+    value_avg_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "value_avg {op} {count}",
+    }
+
+    # Value percentile correlation (SQLite doesn't have native percentile, approximating with subquery)
+    value_percentile_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition}",
+    }
+    value_percentile_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", (SELECT {field} FROM ({search}) ORDER BY {field} LIMIT 1 OFFSET (SELECT COUNT(*) * {percentile} / 100 FROM ({search}))) AS value_percentile",
+    }
+    value_percentile_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "value_percentile {op} {count}",
+    }
+
+    # Value median correlation
+    value_median_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "SELECT {select_fields}{aggregate} FROM ({search}) AS subquery{groupby} HAVING {condition}",
+    }
+    value_median_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", (SELECT AVG({field}) FROM (SELECT {field} FROM ({search}) ORDER BY {field} LIMIT 2 - (SELECT COUNT(*) FROM ({search})) % 2 OFFSET (SELECT (COUNT(*) - 1) / 2 FROM ({search})))) AS value_median",
+    }
+    value_median_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "value_median {op} {count}",
+    }
+
+    # Correlation condition operator mapping
+    correlation_condition_mapping: ClassVar[
+        Optional[Dict[SigmaCorrelationConditionOperator, str]]
+    ] = {
+        SigmaCorrelationConditionOperator.LT: "<",
+        SigmaCorrelationConditionOperator.LTE: "<=",
+        SigmaCorrelationConditionOperator.GT: ">",
+        SigmaCorrelationConditionOperator.GTE: ">=",
+        SigmaCorrelationConditionOperator.EQ: "=",
+        SigmaCorrelationConditionOperator.NEQ: "!=",
+    }
+
+    # Referenced rules expressions
+    referenced_rules_expression: ClassVar[Optional[Dict[str, str]]] = {
+        "default": "'{ruleid}'",
+    }
+    referenced_rules_expression_joiner: ClassVar[Optional[Dict[str, str]]] = {
+        "default": ", ",
+    }
+
     table = "<TABLE_NAME>"
+    timestamp_field = "timestamp"  # Default timestamp field name for correlations
+
+    def convert_correlation_rule_from_template(
+        self,
+        rule: SigmaCorrelationRule,
+        correlation_type: SigmaCorrelationTypeLiteral,
+        method: str,
+    ) -> List[str]:
+        """
+        Override to add {select_fields} placeholder that properly handles GROUP BY.
+        When GROUP BY is used, we select only the grouped fields (not SELECT *).
+        In SQLite, GROUP BY does not guarantee the order of the results, so we need to select only the grouped fields to avoid undefined behavior.
+        Also substitutes the configurable timestamp_field in the generated query.
+        """
+        from sigma.exceptions import SigmaConversionError
+
+        template = (
+            getattr(self, f"{correlation_type}_correlation_query") or self.default_correlation_query
+        )
+        if template is None:
+            raise NotImplementedError(
+                f"Correlation rule type '{correlation_type}' is not supported by backend."
+            )
+
+        if method not in template:
+            raise SigmaConversionError(
+                rule,
+                rule.source,
+                f"Correlation method '{method}' is not supported by backend for correlation type '{correlation_type}'.",
+            )
+
+        search = self.convert_correlation_search(rule)
+
+        # Determine select_fields based on whether GROUP BY is used
+        if rule.group_by:
+            # When GROUP BY is used, only select the grouped fields
+            select_fields = ", ".join(self.escape_and_quote_field(f) for f in rule.group_by)
+        else:
+            # When no GROUP BY, we can use * since all rows aggregate to one
+            select_fields = "*"
+
+        # Get the aggregate expression and substitute the timestamp field
+        aggregate = self.convert_correlation_aggregation_from_template(
+            rule, correlation_type, method, search
+        )
+        # Replace hardcoded 'timestamp' with the configurable timestamp_field
+        aggregate = aggregate.replace("timestamp", self.timestamp_field)
+
+        query = template[method].format(
+            search=search,
+            typing=self.convert_correlation_typing(rule),
+            timespan=self.convert_timespan(rule.timespan, method),
+            aggregate=aggregate,
+            condition=self.convert_correlation_condition_from_template(
+                rule.condition, rule.rules, correlation_type, method
+            ),
+            groupby=self.convert_correlation_aggregation_groupby_from_template(
+                rule.group_by, method
+            ),
+            select_fields=select_fields,
+        )
+
+        return [query]
 
     def convert_value_str(
         self, s: SigmaString, state: ConversionState, no_quote: bool = False, glob_wildcards: bool = False
@@ -371,22 +610,27 @@ class sqliteBackend(TextQueryBackend):
         return self.convert_condition(expanded_cond, state)
 
     def finalize_query_default(
-        self, rule: SigmaRule, query: str, index: int, state: ConversionState
+        self, rule: Union[SigmaRule, SigmaCorrelationRule], query: str, index: int, state: ConversionState
     ) -> Any:
+        # For correlation rules, the query is already complete
+        if isinstance(rule, SigmaCorrelationRule):
+            return query
 
         # TODO : fields support will be handled with a backend option (all fields by default)
         # fields = "*" if len(rule.fields) == 0 else f"*, {', '.join(rule.fields)}"
 
-        # TODO : table name will be handled with a backend option
         sqlite_query = f"SELECT * FROM {self.table} WHERE {query}"
 
         return sqlite_query
 
     def finalize_query_zircolite(
-        self, rule: SigmaRule, query: str, index: int, state: ConversionState
+        self, rule: Union[SigmaRule, SigmaCorrelationRule], query: str, index: int, state: ConversionState
     ) -> Any:
-
-        sqlite_query = f"SELECT * FROM logs WHERE {query}"
+        # For correlation rules, use the query as-is (already formatted)
+        if isinstance(rule, SigmaCorrelationRule):
+            sqlite_query = query
+        else:
+            sqlite_query = f"SELECT * FROM logs WHERE {query}"
 
         rule_as_dict = rule.to_dict()
 

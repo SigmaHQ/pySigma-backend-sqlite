@@ -1,11 +1,15 @@
 import pytest
 from sigma.collection import SigmaCollection
 from sigma.backends.sqlite import sqliteBackend
+from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
 
 
 @pytest.fixture
 def sqlite_backend():
     return sqliteBackend()
+
+
+# ==================== Basic Tests (existing) ====================
 
 
 # TODO: implement tests for some basic queries and their expected results.
@@ -383,5 +387,679 @@ def test_sqlite_zircolite_output(sqlite_backend: sqliteBackend):
     )
 
 
-# TODO: implement tests for all backend features that don't belong to the base class defaults, e.g. features that were
-# implemented with custom code, deferred expressions etc.
+# ==================== Field Reference (fieldref) Modifier Tests ====================
+
+def test_sqlite_fieldref_equals(sqlite_backend: sqliteBackend):
+    """Test field reference modifier - field equals another field"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|fieldref: fieldB
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA=fieldB"]
+    )
+
+
+def test_sqlite_fieldref_multiple_values(sqlite_backend: sqliteBackend):
+    """Test field reference modifier with multiple field values"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|fieldref:
+                        - fieldD
+                        - fieldE
+                    fieldB: foo
+                    fieldC: bar
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE (fieldA=fieldD OR fieldA=fieldE) AND fieldB='foo' AND fieldC='bar'"]
+    )
+
+
+# ==================== Timestamp Part Modifier Tests ====================
+
+def test_sqlite_timestamp_hour(sqlite_backend: sqliteBackend):
+    """Test hour timestamp part modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    timestamp|hour: 14
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%H', timestamp) AS INTEGER)=14"]
+    )
+
+
+def test_sqlite_timestamp_minute(sqlite_backend: sqliteBackend):
+    """Test minute timestamp part modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    timestamp|minute: 30
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%M', timestamp) AS INTEGER)=30"]
+    )
+
+
+def test_sqlite_timestamp_day(sqlite_backend: sqliteBackend):
+    """Test day timestamp part modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    timestamp|day: 15
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%d', timestamp) AS INTEGER)=15"]
+    )
+
+
+def test_sqlite_timestamp_week(sqlite_backend: sqliteBackend):
+    """Test week timestamp part modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    timestamp|week: 42
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%W', timestamp) AS INTEGER)=42"]
+    )
+
+
+def test_sqlite_timestamp_month(sqlite_backend: sqliteBackend):
+    """Test month timestamp part modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    timestamp|month: 12
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%m', timestamp) AS INTEGER)=12"]
+    )
+
+
+def test_sqlite_timestamp_year(sqlite_backend: sqliteBackend):
+    """Test year timestamp part modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    timestamp|year: 2024
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%Y', timestamp) AS INTEGER)=2024"]
+    )
+
+
+# ==================== Comparison Modifier Tests ====================
+
+def test_sqlite_compare_gt(sqlite_backend: sqliteBackend):
+    """Test greater than comparison modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|gt: 100
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA > 100"]
+    )
+
+
+def test_sqlite_compare_gte(sqlite_backend: sqliteBackend):
+    """Test greater than or equal comparison modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|gte: 100
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA >= 100"]
+    )
+
+
+def test_sqlite_compare_lt(sqlite_backend: sqliteBackend):
+    """Test less than comparison modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|lt: 50
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA < 50"]
+    )
+
+
+def test_sqlite_compare_lte(sqlite_backend: sqliteBackend):
+    """Test less than or equal comparison modifier"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|lte: 50
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA <= 50"]
+    )
+
+
+# ==================== All Modifier Tests ====================
+
+def test_sqlite_all_modifier(sqlite_backend: sqliteBackend):
+    """Test all modifier - all values must match"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|all:
+                        - value1
+                        - value2
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='value1' AND fieldA='value2'"]
+    )
+
+
+def test_sqlite_all_contains_modifier(sqlite_backend: sqliteBackend):
+    """Test all modifier with contains"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|all|contains:
+                        - part1
+                        - part2
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE '%part1%' ESCAPE '\\' AND fieldA LIKE '%part2%' ESCAPE '\\'"]
+    )
+
+
+# ==================== Null Value Tests ====================
+
+def test_sqlite_null_value(sqlite_backend: sqliteBackend):
+    """Test null value detection"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: null
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA IS NULL"]
+    )
+
+
+# ==================== Boolean Value Tests ====================
+
+def test_sqlite_boolean_true(sqlite_backend: sqliteBackend):
+    """Test boolean true value"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: true
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA=true"]
+    )
+
+
+def test_sqlite_boolean_false(sqlite_backend: sqliteBackend):
+    """Test boolean false value"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: false
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA=false"]
+    )
+
+
+# ==================== Correlation Tests ====================
+
+def test_sqlite_correlation_event_count_basic(sqlite_backend: sqliteBackend):
+    """Test basic event count correlation"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Event Count Correlation
+        status: test
+        correlation:
+            type: event_count
+            rules: base_rule
+            timespan: 5m
+            condition:
+                gte: 10
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT *, COUNT(*) AS event_count FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING event_count >= 10"
+    ]
+
+
+def test_sqlite_correlation_event_count_with_groupby(sqlite_backend: sqliteBackend):
+    """Test event count correlation with group by - only selects grouped fields to avoid undefined behavior"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Event Count Correlation with Group By
+        status: test
+        correlation:
+            type: event_count
+            rules: base_rule
+            group-by:
+                - SourceIP
+            timespan: 5m
+            condition:
+                gte: 5
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT SourceIP, COUNT(*) AS event_count FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery GROUP BY SourceIP HAVING event_count >= 5"
+    ]
+
+
+def test_sqlite_correlation_value_count(sqlite_backend: sqliteBackend):
+    """Test value count correlation"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Value Count Correlation
+        status: test
+        correlation:
+            type: value_count
+            rules: base_rule
+            timespan: 5m
+            condition:
+                field: TargetUserName
+                gte: 3
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT *, COUNT(DISTINCT TargetUserName) AS value_count FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_count >= 3"
+    ]
+
+
+def test_sqlite_correlation_temporal(sqlite_backend: sqliteBackend):
+    """Test temporal correlation - only selects grouped fields to avoid undefined behavior"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Rule A
+        name: rule_a
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Rule B
+        name: rule_b
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Temporal Correlation
+        status: test
+        correlation:
+            type: temporal
+            rules:
+                - rule_a
+                - rule_b
+            timespan: 5m
+            group-by:
+                - TargetUserName
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT TargetUserName, COUNT(DISTINCT sigma_rule_id) AS rule_count, MIN(timestamp) AS first_event, MAX(timestamp) AS last_event FROM (SELECT *, 'rule_a' AS sigma_rule_id FROM logs WHERE EventID=1234 UNION ALL SELECT *, 'rule_b' AS sigma_rule_id FROM logs WHERE EventID=1234) AS subquery GROUP BY TargetUserName HAVING rule_count >= 2 AND (julianday(last_event) - julianday(first_event)) * 86400 <= 300"
+    ]
+
+
+def test_sqlite_correlation_value_sum(sqlite_backend: sqliteBackend):
+    """Test value sum correlation"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Value Sum Correlation
+        status: test
+        correlation:
+            type: value_sum
+            rules: base_rule
+            timespan: 1h
+            condition:
+                field: BytesSent
+                gte: 1000000
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT *, SUM(BytesSent) AS value_sum FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_sum >= 1000000"
+    ]
+
+
+def test_sqlite_correlation_value_avg(sqlite_backend: sqliteBackend):
+    """Test value avg correlation"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Value Avg Correlation
+        status: test
+        correlation:
+            type: value_avg
+            rules: base_rule
+            timespan: 1h
+            condition:
+                field: BytesSent
+                gte: 50000
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT *, AVG(BytesSent) AS value_avg FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_avg >= 50000"
+    ]
+
+
+# ==================== Additional Modifier Tests ====================
+
+def test_sqlite_exists_modifier(sqlite_backend: sqliteBackend):
+    """Test exists modifier - field must exist (not null)"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|exists: true
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA = fieldA"]
+    )
+
+
+def test_sqlite_not_condition(sqlite_backend: sqliteBackend):
+    """Test NOT condition"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: valueA
+                filter:
+                    fieldB: valueB
+                condition: sel and not filter
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT fieldB='valueB')"]
+    )
+
+
+def test_sqlite_custom_timestamp_field():
+    """Test that timestamp_field can be customized for temporal correlations"""
+    backend = sqliteBackend(correlation_methods=["default"])
+    backend.timestamp_field = "event_time"
+
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Temporal Correlation
+        status: test
+        correlation:
+            type: temporal
+            rules: base_rule
+            timespan: 5m
+            condition:
+                gte: 2
+    """
+    )
+    result = backend.convert(rules)
+    # Verify the custom timestamp field is used instead of the default 'timestamp'
+    assert "MIN(event_time)" in result[0]
+    assert "MAX(event_time)" in result[0]
+    assert "MIN(timestamp)" not in result[0]
+    assert "MAX(timestamp)" not in result[0]
