@@ -15,7 +15,9 @@ packages = [
 
 [tool.poetry.dependencies]
 python = "^3.10"
-pysigma = ">0.11.17,<2"
+pysigma = "1.0.2"
+pysigma-pipeline-windows = "^2.0.0"
+pysigma-pipeline-sysmon = "^2.0.0"
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.1"
@@ -23,6 +25,12 @@ pytest = "^8.0"
 pytest-cov = "^4.1"
 coverage = "^7.4"
 
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Suppress pyparsing deprecation warning from pySigma library
+    "ignore:'parseString' deprecated:DeprecationWarning",
+]
 
 [tool.pdm]
 [tool.pdm.dev-dependencies]
