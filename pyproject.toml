@@ -49,3 +49,4 @@ Repository = "https://github.com/SigmaHQ/pySigma-backend-sqlite"
 pytest = "^8.0"
 pytest-cov = "^4.1"
 coverage = "^7.4"
+
