@@ -1,0 +1,100 @@
+version: '3'
+
+vars:
+  PYTHON: python3
+  POETRY: poetry
+
+tasks:
+  default:
+    desc: Run all tests
+    cmds:
+      - task: test
+
+  install:
+    desc: Install dependencies with Poetry
+    cmds:
+      - "{{.POETRY}} install"
+
+  test:
+    desc: Run all tests with pytest
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/ -v"
+
+  test:quick:
+    desc: Run tests without verbose output
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/"
+
+  test:coverage:
+    desc: Run tests with coverage report
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/ -v --cov=sigma/backends/sqlite --cov-report=term-missing"
+
+  test:coverage:html:
+    desc: Run tests with HTML coverage report
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/ -v --cov=sigma/backends/sqlite --cov-report=html"
+      - echo "Coverage report generated in htmlcov/index.html"
+
+  test:single:
+    desc: Run a single test (use TEST=test_name)
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/test_backend_sqlite.py::{{.TEST}} -v"
+    vars:
+      TEST: '{{default "test_sqlite_and_expression" .TEST}}'
+
+  test:pattern:
+    desc: Run tests matching a pattern (use PATTERN=pattern)
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/ -v -k '{{.PATTERN}}'"
+    vars:
+      PATTERN: '{{default "" .PATTERN}}'
+
+  test:correlation:
+    desc: Run only correlation tests
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/ -v -k 'correlation'"
+
+  test:modifiers:
+    desc: Run modifier-related tests
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} run pytest tests/ -v -k 'fieldref or timestamp or compare or all_modifier'"
+
+  lint:
+    desc: Run linting with ruff (if available)
+    cmds:
+      - "{{.POETRY}} run ruff check sigma/ tests/"
+    ignore_error: true
+
+  format:
+    desc: Format code with black (if available)
+    cmds:
+      - "{{.POETRY}} run black sigma/ tests/"
+    ignore_error: true
+
+  clean:
+    desc: Clean up cache and build artifacts
+    cmds:
+      - rm -rf __pycache__ .pytest_cache .coverage htmlcov
+      - rm -rf sigma/backends/sqlite/__pycache__
+      - rm -rf tests/__pycache__
+      - find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+
+  build:
+    desc: Build the package
+    deps: [install]
+    cmds:
+      - "{{.POETRY}} build"
+
+  shell:
+    desc: Open a Poetry shell
+    cmds:
+      - "{{.POETRY}} shell"
