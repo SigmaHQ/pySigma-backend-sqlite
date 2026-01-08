@@ -2,10 +2,6 @@
 ![Coverage Badge](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/wagga40/2ec45ded898fa11f2c42bcb9d2b163cf/raw/test.json)
 ![Status](https://img.shields.io/badge/Status-pre--release-orange)
 
-# This repository is no longer the main one, it has been forked and is now included in the SigmaHQ organisation.
-
-Follow this [link](https://github.com/SigmaHQ/pySigma-backend-sqlite)
-
 # pySigma SQLite Backend
 
 This is the SQLite backend for pySigma. It provides the package `sigma.backends.sqlite` with the `sqliteBackend` class.
