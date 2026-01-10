@@ -534,14 +534,14 @@ files = [
 
 [[package]]
 name = "pathspec"
-version = "1.0.2"
+version = "1.0.3"
 description = "Utility library for gitignore style pattern matching of file paths."
 optional = false
 python-versions = ">=3.9"
 groups = ["dev"]
 files = [
-    {file = "pathspec-1.0.2-py3-none-any.whl", hash = "sha256:62f8558917908d237d399b9b338ef455a814801a4688bc41074b25feefd93472"},
-    {file = "pathspec-1.0.2.tar.gz", hash = "sha256:fa32b1eb775ed9ba8d599b22c5f906dc098113989da2c00bf8b210078ca7fb92"},
+    {file = "pathspec-1.0.3-py3-none-any.whl", hash = "sha256:e80767021c1cc524aa3fb14bedda9c34406591343cc42797b386ce7b9354fb6c"},
+    {file = "pathspec-1.0.3.tar.gz", hash = "sha256:bac5cf97ae2c2876e2d25ebb15078eb04d76e4b98921ee31c6f85ade8b59444d"},
 ]
 
 [package.extras]
@@ -635,36 +635,6 @@ pyyaml = ">=6.0.3,<7.0.0"
 requests = ">=2.32.5,<3.0.0"
 types-pyyaml = ">=6.0.12.20250915,<7.0.0.0"
 typing-extensions = ">=4.15.0,<5.0.0"
-
-[[package]]
-name = "pysigma-pipeline-sysmon"
-version = "2.0.0"
-description = "pySigma Sysmon processing pipelines"
-optional = false
-python-versions = "<4.0,>=3.10"
-groups = ["main"]
-files = [
-    {file = "pysigma_pipeline_sysmon-2.0.0-py3-none-any.whl", hash = "sha256:84575bbde5dd891882306ca1f6ce16bdc592da2e511ac8960012af2efb9d120b"},
-    {file = "pysigma_pipeline_sysmon-2.0.0.tar.gz", hash = "sha256:a05c4f0d59602c4002bc0a1b9189508454f85ec397f5fd20294d3b56006bee54"},
-]
-
-[package.dependencies]
-pysigma = ">=1.0.0,<2.0.0"
-
-[[package]]
-name = "pysigma-pipeline-windows"
-version = "2.0.0"
-description = "pySigma Windows processing pipelines"
-optional = false
-python-versions = "<4.0,>=3.10"
-groups = ["main"]
-files = [
-    {file = "pysigma_pipeline_windows-2.0.0-py3-none-any.whl", hash = "sha256:906ffe558cb43576b0590ae98a9a3463ed10b958d7a9bd2803ffde9f1d769ec3"},
-    {file = "pysigma_pipeline_windows-2.0.0.tar.gz", hash = "sha256:2abd390f1b90c4cbe4f65cc05bf05ee03f8f413c204d3d3f0a734850ba5c4715"},
-]
-
-[package.dependencies]
-pysigma = ">=1.0,<2.0"
 
 [[package]]
 name = "pytest"
@@ -913,4 +883,4 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "0802bae770155de1b6c9acb0bca7503251cd169583b75534b430010345a8cce5"
+content-hash = "4246c1ef66be343d3daf1951ee28b11b3fbc3883296cf88528a156e4daca91d3"

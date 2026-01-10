@@ -15,9 +15,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = "^3.10"
-pysigma = "1.0.2"
-pysigma-pipeline-windows = "^2.0.0"
-pysigma-pipeline-sysmon = "^2.0.0"
+pysigma = ">=1.0.2,<1.1.0"
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.1"
