@@ -623,14 +623,69 @@ class sqliteBackend(TextQueryBackend):
 
         return sqlite_query
 
+    def _extract_field_values_from_rule(
+        self, rule: SigmaRule, field_name: str
+    ) -> List[Any]:
+        """
+        Extract all values for a given field name from a rule's detection section.
+        Returns a list of unique values found for the specified field.
+        """
+        from sigma.rule import SigmaDetectionItem
+        from sigma.types import SigmaString, SigmaNumber
+
+        values = set()
+        field_name_lower = field_name.lower()
+
+        # Iterate through all detection groups (sel, filter, etc.)
+        for detection_name, detection in rule.detection.detections.items():
+            # Each detection has detection_items
+            self._extract_values_from_detection(detection, field_name_lower, values)
+
+        return sorted(list(values), key=lambda x: str(x))
+
+    def _extract_values_from_detection(
+        self, detection, field_name_lower: str, values: set
+    ) -> None:
+        """
+        Recursively extract values from a detection for a given field name.
+        """
+        from sigma.rule import SigmaDetectionItem
+        from sigma.types import SigmaString, SigmaNumber
+
+        # Check if detection has detection_items attribute
+        if hasattr(detection, 'detection_items'):
+            for item in detection.detection_items:
+                self._extract_values_from_detection(item, field_name_lower, values)
+
+        # Check if this is a SigmaDetectionItem with field and value
+        if hasattr(detection, 'field') and hasattr(detection, 'value'):
+            # Check if the field matches (case-insensitive)
+            if detection.field and detection.field.lower() == field_name_lower:
+                # Extract the values
+                for value in detection.value:
+                    # Handle different value types
+                    if isinstance(value, SigmaNumber):
+                        values.add(value.number)
+                    elif isinstance(value, SigmaString):
+                        # SigmaString - convert to plain string
+                        values.add(str(value))
+                    else:
+                        values.add(str(value))
+
     def finalize_query_zircolite(
         self, rule: Union[SigmaRule, SigmaCorrelationRule], query: str, index: int, state: ConversionState
     ) -> Any:
         # For correlation rules, use the query as-is (already formatted)
         if isinstance(rule, SigmaCorrelationRule):
             sqlite_query = query
+            # Correlation rules don't have detection items in the same way
+            channels = []
+            event_ids = []
         else:
             sqlite_query = f"SELECT * FROM logs WHERE {query}"
+            # Extract channels and event IDs from the rule's detection
+            channels = self._extract_field_values_from_rule(rule, "Channel")
+            event_ids = self._extract_field_values_from_rule(rule, "EventID")
 
         rule_as_dict = rule.to_dict()
 
@@ -651,6 +706,8 @@ class sqliteBackend(TextQueryBackend):
             "level": rule_as_dict["level"] if "level" in rule_as_dict else "",
             "rule": [sqlite_query],
             "filename": "",
+            "channel": channels,
+            "eventid": event_ids,
         }
         return zircolite_rule
 

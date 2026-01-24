@@ -383,8 +383,81 @@ def test_sqlite_zircolite_output(sqlite_backend: sqliteBackend):
     )
     assert (
         sqlite_backend.convert(rule, "zircolite")
-        == '[{"title": "Test", "id": "", "status": "test", "description": "", "author": "", "tags": [], "falsepositives": [], "level": "", "rule": ["SELECT * FROM logs WHERE fieldA=\'value\'"], "filename": ""}]'
+        == '[{"title": "Test", "id": "", "status": "test", "description": "", "author": "", "tags": [], "falsepositives": [], "level": "", "rule": ["SELECT * FROM logs WHERE fieldA=\'value\'"], "filename": "", "channel": [], "eventid": []}]'
     )
+
+
+def test_sqlite_zircolite_output_with_channel_and_eventid(sqlite_backend: sqliteBackend):
+    """Test Zircolite output includes channel and eventid arrays"""
+    import json
+    rule = SigmaCollection.from_yaml(
+        r"""
+            title: Test with Channel and EventID
+            status: test
+            logsource:
+                category: test_category
+                product: windows
+            detection:
+                sel:
+                    Channel:
+                        - Security
+                        - Microsoft-Windows-Sysmon/Operational
+                    EventID:
+                        - 1
+                        - 4688
+                        - 7045
+                condition: sel
+        """
+    )
+    result = json.loads(sqlite_backend.convert(rule, "zircolite"))
+    assert result[0]["channel"] == ["Microsoft-Windows-Sysmon/Operational", "Security"]
+    assert result[0]["eventid"] == [1, 4688, 7045]
+
+
+def test_sqlite_zircolite_output_with_single_eventid(sqlite_backend: sqliteBackend):
+    """Test Zircolite output with a single EventID"""
+    import json
+    rule = SigmaCollection.from_yaml(
+        r"""
+            title: Test with Single EventID
+            status: test
+            logsource:
+                category: test_category
+                product: windows
+            detection:
+                sel:
+                    EventID: 4624
+                condition: sel
+        """
+    )
+    result = json.loads(sqlite_backend.convert(rule, "zircolite"))
+    assert result[0]["channel"] == []
+    assert result[0]["eventid"] == [4624]
+
+
+def test_sqlite_zircolite_output_eventid_from_multiple_selections(sqlite_backend: sqliteBackend):
+    """Test Zircolite output extracts EventIDs from multiple detection selections"""
+    import json
+    rule = SigmaCollection.from_yaml(
+        r"""
+            title: Test with Multiple Selections
+            status: test
+            logsource:
+                category: test_category
+                product: windows
+            detection:
+                sel1:
+                    EventID: 4624
+                    LogonType: 10
+                sel2:
+                    EventID: 4625
+                    LogonType: 10
+                condition: sel1 or sel2
+        """
+    )
+    result = json.loads(sqlite_backend.convert(rule, "zircolite"))
+    assert result[0]["channel"] == []
+    assert set(result[0]["eventid"]) == {4624, 4625}
 
 
 # ==================== Field Reference (fieldref) Modifier Tests ====================

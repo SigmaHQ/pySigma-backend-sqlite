@@ -108,17 +108,18 @@ from sigma.backends.sqlite import sqlite
 from sigma.pipelines.sysmon import sysmon_pipeline
 from sigma.pipelines.windows import windows_logsource_pipeline
 
-from sigma.processing.resolver import ProcessingPipelineResolver
-
-# Create the pipeline resolver
-piperesolver = ProcessingPipelineResolver()
-# Add pipelines
-piperesolver.add_pipeline_class(sysmon_pipeline()) # Syssmon  
-piperesolver.add_pipeline_class(windows_logsource_pipeline()) # Windows
-# Create a combined pipeline
-combined_pipeline = piperesolver.resolve(piperesolver.pipelines)
-# Instantiate backend using the combined pipeline
+# Combine pipelines to map both Channel and EventID:
+# 1. sysmon_pipeline: maps category (e.g., process_creation) -> EventID (e.g., 1)
+#                     and changes logsource to service=sysmon
+# 2. windows_logsource_pipeline: maps service=sysmon -> Channel
+#
+# For process_creation/windows, this produces:
+#   Channel='Microsoft-Windows-Sysmon/Operational' AND EventID=1
+combined_pipeline = sysmon_pipeline() + windows_logsource_pipeline()
 sqlite_backend = sqlite.sqliteBackend(combined_pipeline)
+# Set the table name for the generated SQL queries
+sqlite_backend.table = "logs"
+
 
 rule = SigmaCollection.from_yaml(
 r"""
