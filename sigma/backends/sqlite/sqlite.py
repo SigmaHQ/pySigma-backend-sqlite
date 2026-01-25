@@ -687,23 +687,18 @@ class sqliteBackend(TextQueryBackend):
             channels = self._extract_field_values_from_rule(rule, "Channel")
             event_ids = self._extract_field_values_from_rule(rule, "EventID")
 
-        rule_as_dict = rule.to_dict()
-
+        # Access rule properties directly instead of using to_dict() to avoid
+        # SigmaValueError when pipeline transformations have modified detection items
+        # in ways that make them non-serializable back to plain data types.
         zircolite_rule = {
-            "title": rule_as_dict["title"],
-            "id": rule_as_dict["id"] if "id" in rule_as_dict else "",
-            "status": rule_as_dict["status"] if "status" in rule_as_dict else "",
-            "description": (
-                rule_as_dict["description"] if "description" in rule_as_dict else ""
-            ),
-            "author": rule_as_dict["author"] if "author" in rule_as_dict else "",
-            "tags": rule_as_dict["tags"] if "tags" in rule_as_dict else [],
-            "falsepositives": (
-                rule_as_dict["falsepositives"]
-                if "falsepositives" in rule_as_dict
-                else []
-            ),
-            "level": rule_as_dict["level"] if "level" in rule_as_dict else "",
+            "title": rule.title,
+            "id": str(rule.id) if rule.id else "",
+            "status": rule.status.name.lower() if rule.status else "",
+            "description": rule.description if rule.description else "",
+            "author": rule.author if rule.author else "",
+            "tags": [str(tag) for tag in rule.tags] if rule.tags else [],
+            "falsepositives": list(rule.falsepositives) if rule.falsepositives else [],
+            "level": rule.level.name.lower() if rule.level else "",
             "rule": [sqlite_query],
             "filename": "",
             "channel": channels,
