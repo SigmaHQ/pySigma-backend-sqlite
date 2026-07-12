@@ -35,6 +35,8 @@ This backend is currently maintained by:
 | `gt`, `gte`, `lt`, `lte` | Numeric comparisons | `>`, `>=`, `<`, `<=` |
 | `hour`, `minute`, `day`, `week`, `month`, `year` | Timestamp part extraction | `strftime()` |
 
+> **Note on `cased`:** SQLite's `GLOB` is a native 2-argument operator with no `ESCAPE` clause, so queries are emitted as `field GLOB 'pattern'` and backslashes are kept literal (e.g. Windows paths match as-is). Because `GLOB` has no escape mechanism, a *literal* `*`, `?` or `[` inside a `cased` value is still interpreted as a glob metacharacter; escaping such literals (`[*]`) is not currently supported.
+
 ### Correlation Rules
 
 The backend supports Sigma correlation rules with the following types:
