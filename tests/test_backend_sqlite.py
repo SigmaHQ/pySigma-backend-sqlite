@@ -1124,6 +1124,69 @@ def test_sqlite_correlation_value_avg(sqlite_backend: sqliteBackend):
     ]
 
 
+def test_sqlite_correlation_value_percentile(sqlite_backend: sqliteBackend):
+    """Test value percentile correlation"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Value Percentile Correlation
+        status: test
+        correlation:
+            type: value_percentile
+            rules: base_rule
+            timespan: 5m
+            condition:
+                field: Bytes
+                percentile: 95
+                gte: 1000
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT *, (SELECT Bytes FROM (SELECT * FROM logs WHERE EventID=1234) ORDER BY Bytes LIMIT 1 OFFSET (SELECT COUNT(*) * 95 / 100 FROM (SELECT * FROM logs WHERE EventID=1234))) AS value_percentile FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_percentile >= 1000"
+    ]
+
+
+def test_sqlite_correlation_value_median(sqlite_backend: sqliteBackend):
+    """Test value median correlation"""
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Value Median Correlation
+        status: test
+        correlation:
+            type: value_median
+            rules: base_rule
+            timespan: 5m
+            condition:
+                field: Bytes
+                gte: 500
+    """
+    )
+    assert sqlite_backend.convert(rules) == [
+        "SELECT *, (SELECT AVG(Bytes) FROM (SELECT Bytes FROM (SELECT * FROM logs WHERE EventID=1234) ORDER BY Bytes LIMIT 2 - (SELECT COUNT(*) FROM (SELECT * FROM logs WHERE EventID=1234)) % 2 OFFSET (SELECT (COUNT(*) - 1) / 2 FROM (SELECT * FROM logs WHERE EventID=1234)))) AS value_median FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_median >= 500"
+    ]
+
+
 # ==================== Additional Modifier Tests ====================
 
 def test_sqlite_exists_modifier(sqlite_backend: sqliteBackend):
@@ -1169,6 +1232,82 @@ def test_sqlite_not_condition(sqlite_backend: sqliteBackend):
             )
         )
         == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT fieldB='valueB')"]
+    )
+
+
+def test_sqlite_neq_single_value(sqlite_backend: sqliteBackend):
+    """Test neq modifier with a single value"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|neq: valueA
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE NOT fieldA='valueA'"]
+    )
+
+
+def test_sqlite_neq_multi_value(sqlite_backend: sqliteBackend):
+    """Test neq modifier with multiple values"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|neq:
+                        - val1
+                        - val2
+                condition: sel
+        """
+            )
+        )
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE NOT (fieldA='val1' OR fieldA='val2')"
+        ]
+    )
+
+
+def test_sqlite_wildcard_filter_pattern(sqlite_backend: sqliteBackend):
+    """Regression: filter selections matched via pattern_* with wildcard values"""
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: valueA
+                filter_foo:
+                    fieldB: valueB*
+                filter_bar:
+                    fieldC: valueC
+                condition: sel and not 1 of filter_*
+        """
+            )
+        )
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT (fieldB LIKE 'valueB%' ESCAPE '\\' OR fieldC='valueC'))"
+        ]
     )
 
 

@@ -146,6 +146,9 @@ class sqliteBackend(TextQueryBackend):
 
     # SQLite's GLOB is a 2-argument operator with no ESCAPE clause (unlike LIKE);
     # emitting "ESCAPE '\'" triggers "wrong number of arguments to function GLOB()" at runtime.
+    # Wildcards for |startswith/|endswith/|contains|cased are embedded in the value via
+    # case_sensitive_match_expression; dedicated startswith/endswith/contains templates
+    # would place GLOB metacharacters outside the quoted literal and produce invalid SQL.
     case_sensitive_match_expression: ClassVar[str] = "{field} GLOB {value}"
 
     # Numeric comparison operators
@@ -544,7 +547,7 @@ class sqliteBackend(TextQueryBackend):
     def convert_condition_field_eq_val_str_case_sensitive(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
     ) -> Union[str, DeferredQueryExpression]:
-        """Conversion of case-sensitive field = string value expressions"""
+        """Case-sensitive matching via GLOB with literal backslashes (no ESCAPE clause)."""
         try:
             if (  # Check conditions for usage of 'startswith' operator
                 self.case_sensitive_startswith_expression

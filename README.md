@@ -17,6 +17,11 @@ This backend is currently maintained by:
 
 * [wagga](https://github.com/wagga40/)
 
+## Requirements
+
+* Python 3.10 or later
+* [pySigma](https://github.com/SigmaHQ/pySigma) `>= 1.0.2, < 2.0` (tested with 1.4.0)
+
 ## Supported Features
 
 ### Sigma Modifiers
@@ -33,6 +38,7 @@ This backend is currently maintained by:
 | `fieldref` | Compare two fields | `field1=field2` or with `LIKE` for startswith/endswith/contains |
 | `exists` | Field existence check | `field = field` |
 | `gt`, `gte`, `lt`, `lte` | Numeric comparisons | `>`, `>=`, `<`, `<=` |
+| `neq` | Not equal | `NOT field='value'` |
 | `hour`, `minute`, `day`, `week`, `month`, `year` | Timestamp part extraction | `strftime()` |
 
 > **Note on `cased`:** SQLite's `GLOB` is a native 2-argument operator with no `ESCAPE` clause, so queries are emitted as `field GLOB 'pattern'` and backslashes are kept literal (e.g. Windows paths match as-is). Because `GLOB` has no escape mechanism, a *literal* `*`, `?` or `[` inside a `cased` value is still interpreted as a glob metacharacter; escaping such literals (`[*]`) is not currently supported.
@@ -49,6 +55,10 @@ The backend supports Sigma correlation rules with the following types:
 | `temporal_ordered` | Events occurring in a specific order within a timespan |
 | `value_sum` | Sum of field values |
 | `value_avg` | Average of field values |
+| `value_percentile` | Percentile of field values |
+| `value_median` | Median of field values |
+
+The following correlation types are **not supported**: `temporal_extended`, `temporal_ordered_extended`.
 
 Correlation rules support `group-by` for grouping results and `timespan` for temporal constraints.
 
@@ -104,9 +114,9 @@ poetry add pysigma-pipeline-windows
 
 ### Convert a rule
 
-```python 
+```python
 from sigma.collection import SigmaCollection
-from sigma.backends.sqlite import sqlite
+from sigma.backends.sqlite import sqliteBackend
 from sigma.pipelines.sysmon import sysmon_pipeline
 from sigma.pipelines.windows import windows_logsource_pipeline
 
@@ -118,7 +128,7 @@ from sigma.pipelines.windows import windows_logsource_pipeline
 # For process_creation/windows, this produces:
 #   Channel='Microsoft-Windows-Sysmon/Operational' AND EventID=1
 combined_pipeline = sysmon_pipeline() + windows_logsource_pipeline()
-sqlite_backend = sqlite.sqliteBackend(combined_pipeline)
+sqlite_backend = sqliteBackend(combined_pipeline)
 # Set the table name for the generated SQL queries
 sqlite_backend.table = "logs"
 
