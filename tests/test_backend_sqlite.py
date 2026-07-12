@@ -363,9 +363,79 @@ def test_sqlite_value_case_sensitive_contains(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB '*VaLuE*' ESCAPE '\\'"
+            "SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB '*VaLuE*'"
         ]
     )
+
+
+def test_sqlite_value_case_sensitive_match(sqlite_backend: sqliteBackend):
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                r"""
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|cased: 'C:\Windows\System32\cmd.exe'
+                condition: sel
+        """
+            )
+        )
+        == [
+            r"SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB 'C:\Windows\System32\cmd.exe'"
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("detection", "stored", "should_match"),
+    [
+        # |cased must not emit "ESCAPE" (SQLite GLOB is a 2-arg operator) and must
+        # not escape backslashes, otherwise these queries raise
+        # "wrong number of arguments to function GLOB()" or silently mismatch.
+        (r"fieldA|cased: 'C:\Temp\app.exe'", r"C:\Temp\app.exe", True),
+        (r"fieldA|cased: 'C:\Temp\app.exe'", r"c:\temp\app.exe", False),
+        ("fieldA|contains|cased: VaLuE", "prefix VaLuE suffix", True),
+        ("fieldA|contains|cased: VaLuE", "prefix value suffix", False),
+        ("fieldA|startswith|cased: VaLuE", "VaLuE at start", True),
+        ("fieldA|startswith|cased: VaLuE", "no VaLuE here", False),
+        ("fieldA|endswith|cased: VaLuE", "ends with VaLuE", True),
+        ("fieldA|endswith|cased: VaLuE", "VaLuE not at end", False),
+    ],
+)
+def test_sqlite_case_sensitive_executes_on_sqlite3(
+    sqlite_backend: sqliteBackend, detection: str, stored: str, should_match: bool
+):
+    """Generated |cased queries must actually run against a real sqlite3 connection."""
+    import sqlite3
+
+    rule = SigmaCollection.from_yaml(
+        "title: Test\n"
+        "status: test\n"
+        "logsource:\n"
+        "    category: test_category\n"
+        "    product: test_product\n"
+        "detection:\n"
+        "    sel:\n"
+        f"        {detection}\n"
+        "    condition: sel\n"
+    )
+    query = sqlite_backend.convert(rule)[0].replace("<TABLE_NAME>", "t")
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE t (fieldA)")
+        conn.execute("INSERT INTO t VALUES (?)", (stored,))
+        matched = bool(conn.execute(query).fetchall())
+    finally:
+        conn.close()
+
+    assert matched is should_match
+
 
 def test_sqlite_zircolite_output(sqlite_backend: sqliteBackend):
     rule = SigmaCollection.from_yaml(

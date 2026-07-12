@@ -144,7 +144,9 @@ class sqliteBackend(TextQueryBackend):
     # remove it from re_flags or don't define it to ensure proper error handling in case of appearance.
     # re_flags : Dict[SigmaRegularExpressionFlag, str] = {}
 
-    case_sensitive_match_expression: ClassVar[str] = "{field} GLOB {value} ESCAPE '\\'"
+    # SQLite's GLOB is a 2-argument operator with no ESCAPE clause (unlike LIKE);
+    # emitting "ESCAPE '\'" triggers "wrong number of arguments to function GLOB()" at runtime.
+    case_sensitive_match_expression: ClassVar[str] = "{field} GLOB {value}"
 
     # Numeric comparison operators
     compare_op_expression: ClassVar[str] = (
@@ -449,7 +451,9 @@ class sqliteBackend(TextQueryBackend):
                 escape_char=self.escape_char,
                 wildcard_multi=self.wildcard_glob,
                 wildcard_single=self.wildcard_glob_single,
-                add_escaped=self.add_escaped,
+                # GLOB has no ESCAPE clause, so backslashes must stay literal.
+                # Escaping them (as LIKE requires) would break matches like Windows paths.
+                add_escaped="",
                 filter_chars=self.filter_chars,
             )
         else:
