@@ -1345,3 +1345,59 @@ def test_sqlite_custom_timestamp_field():
     assert "MAX(event_time)" in result[0]
     assert "MIN(timestamp)" not in result[0]
     assert "MAX(timestamp)" not in result[0]
+
+
+def test_sqlite_table_name_from_setstate_pipeline():
+    """Table name is set via a setState transformation ('table' key) for plain and correlation rules."""
+    from sigma.processing.pipeline import ProcessingPipeline, ProcessingItem
+    from sigma.processing.transformations import SetStateTransformation
+
+    pipeline = ProcessingPipeline(
+        items=[ProcessingItem(transformation=SetStateTransformation("table", "my_events"))]
+    )
+    backend = sqliteBackend(processing_pipeline=pipeline)
+
+    # Plain rule uses the pipeline-provided table name.
+    plain = SigmaCollection.from_yaml(
+        """
+        title: Plain Rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                fieldA: valueA
+            condition: sel
+    """
+    )
+    assert backend.convert(plain) == ["SELECT * FROM my_events WHERE fieldA='valueA'"]
+
+    # Correlation subquery uses it too, not the hardcoded 'logs'.
+    correlation = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+            product: test_product
+        detection:
+            sel:
+                fieldA: valueA
+            condition: sel
+---
+        title: Event Count Correlation
+        status: test
+        correlation:
+            type: event_count
+            rules: base_rule
+            group-by: fieldA
+            timespan: 5m
+            condition:
+                gte: 10
+    """
+    )
+    result = backend.convert(correlation)
+    assert "FROM my_events" in result[0]
+    assert "FROM logs" not in result[0]
