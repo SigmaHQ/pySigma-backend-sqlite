@@ -13,6 +13,7 @@ from sigma.conditions import (
 )
 from sigma.types import (
     SigmaCompareExpression,
+    SigmaRegularExpression,
     SigmaString,
     SpecialChars,
     SigmaCIDRExpression,
@@ -476,6 +477,12 @@ class sqliteBackend(TextQueryBackend):
             return self.quote_string(converted)
         else:
             return converted
+
+    def convert_value_re(
+        self, r: SigmaRegularExpression, state: ConversionState
+    ) -> str:
+        # Doubling single quotes is mandatory: the regex is embedded in a '...' SQL string literal.
+        return super().convert_value_re(r, state).replace("'", "''")
 
     def convert_condition_field_eq_val_str(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState

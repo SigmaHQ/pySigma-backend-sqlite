@@ -163,6 +163,27 @@ def test_sqlite_regex_query(sqlite_backend: sqliteBackend):
     )
 
 
+def test_sqlite_regex_query_single_quote(sqlite_backend: sqliteBackend):
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|re: it's.exe
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA REGEXP 'it''s.exe'"]
+    )
+
+
 def test_sqlite_cidr_query(sqlite_backend: sqliteBackend):
     assert (
         sqlite_backend.convert(
