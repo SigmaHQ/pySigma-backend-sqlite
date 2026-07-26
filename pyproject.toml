@@ -1,6 +1,6 @@
 [project]
 name = "pySigma-backend-sqlite"
-version = "1.2.0"
+version = "1.2.2"
 description = "pySigma sqlite backend"
 readme = "README.md"
 authors = [
