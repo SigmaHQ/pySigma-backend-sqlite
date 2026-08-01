@@ -414,6 +414,12 @@ class sqliteBackend(TextQueryBackend):
 
         search = self.convert_correlation_search(rule)
 
+        # Correlation search templates hardcode "FROM logs"; honor a "table" state
+        # key set by a setState transformation, matching finalize_query_default.
+        table = self.last_processing_pipeline.state.get("table")
+        if table is not None:
+            search = search.replace("FROM logs", f"FROM {table}")
+
         # Determine select_fields based on whether GROUP BY is used
         if rule.group_by:
             # When GROUP BY is used, only select the grouped fields
@@ -633,7 +639,10 @@ class sqliteBackend(TextQueryBackend):
         # TODO : fields support will be handled with a backend option (all fields by default)
         # fields = "*" if len(rule.fields) == 0 else f"*, {', '.join(rule.fields)}"
 
-        sqlite_query = f"SELECT * FROM {self.table} WHERE {query}"
+        # Table name can be overridden per-pipeline via a setState transformation
+        # setting the "table" state key, else fall back to the backend default.
+        table = state.processing_state.get("table", self.table)
+        sqlite_query = f"SELECT * FROM {table} WHERE {query}"
 
         return sqlite_query
 
