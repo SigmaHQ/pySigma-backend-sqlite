@@ -366,6 +366,7 @@ def test_sqlite_fts_keywords_num(sqlite_backend: sqliteBackend):
         == "Value-only number expressions (i.e Full Text Search or 'keywords' search) are not supported by the backend."
     )
 
+
 def test_sqlite_value_case_sensitive_contains(sqlite_backend: sqliteBackend):
     assert (
         sqlite_backend.convert(
@@ -383,9 +384,7 @@ def test_sqlite_value_case_sensitive_contains(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB '*VaLuE*'"
-        ]
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB '*VaLuE*'"]
     )
 
 
@@ -478,9 +477,12 @@ def test_sqlite_zircolite_output(sqlite_backend: sqliteBackend):
     )
 
 
-def test_sqlite_zircolite_output_with_channel_and_eventid(sqlite_backend: sqliteBackend):
+def test_sqlite_zircolite_output_with_channel_and_eventid(
+    sqlite_backend: sqliteBackend,
+):
     """Test Zircolite output includes channel and eventid arrays"""
     import json
+
     rule = SigmaCollection.from_yaml(
         r"""
             title: Test with Channel and EventID
@@ -508,6 +510,7 @@ def test_sqlite_zircolite_output_with_channel_and_eventid(sqlite_backend: sqlite
 def test_sqlite_zircolite_output_with_single_eventid(sqlite_backend: sqliteBackend):
     """Test Zircolite output with a single EventID"""
     import json
+
     rule = SigmaCollection.from_yaml(
         r"""
             title: Test with Single EventID
@@ -526,9 +529,12 @@ def test_sqlite_zircolite_output_with_single_eventid(sqlite_backend: sqliteBacke
     assert result[0]["eventid"] == [4624]
 
 
-def test_sqlite_zircolite_output_eventid_from_multiple_selections(sqlite_backend: sqliteBackend):
+def test_sqlite_zircolite_output_eventid_from_multiple_selections(
+    sqlite_backend: sqliteBackend,
+):
     """Test Zircolite output extracts EventIDs from multiple detection selections"""
     import json
+
     rule = SigmaCollection.from_yaml(
         r"""
             title: Test with Multiple Selections
@@ -552,6 +558,7 @@ def test_sqlite_zircolite_output_eventid_from_multiple_selections(sqlite_backend
 
 
 # ==================== Field Reference (fieldref) Modifier Tests ====================
+
 
 def test_sqlite_fieldref_equals(sqlite_backend: sqliteBackend):
     """Test field reference modifier - field equals another field"""
@@ -597,11 +604,14 @@ def test_sqlite_fieldref_multiple_values(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE (fieldA=fieldD OR fieldA=fieldE) AND fieldB='foo' AND fieldC='bar'"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE (fieldA=fieldD OR fieldA=fieldE) AND fieldB='foo' AND fieldC='bar'"
+        ]
     )
 
 
 # ==================== Timestamp Part Modifier Tests ====================
+
 
 def test_sqlite_timestamp_hour(sqlite_backend: sqliteBackend):
     """Test hour timestamp part modifier"""
@@ -621,7 +631,9 @@ def test_sqlite_timestamp_hour(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%H', timestamp) AS INTEGER)=14"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%H', timestamp) AS INTEGER)=14"
+        ]
     )
 
 
@@ -643,7 +655,9 @@ def test_sqlite_timestamp_minute(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%M', timestamp) AS INTEGER)=30"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%M', timestamp) AS INTEGER)=30"
+        ]
     )
 
 
@@ -665,7 +679,9 @@ def test_sqlite_timestamp_day(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%d', timestamp) AS INTEGER)=15"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%d', timestamp) AS INTEGER)=15"
+        ]
     )
 
 
@@ -687,7 +703,9 @@ def test_sqlite_timestamp_week(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%W', timestamp) AS INTEGER)=42"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%W', timestamp) AS INTEGER)=42"
+        ]
     )
 
 
@@ -709,7 +727,9 @@ def test_sqlite_timestamp_month(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%m', timestamp) AS INTEGER)=12"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%m', timestamp) AS INTEGER)=12"
+        ]
     )
 
 
@@ -731,11 +751,14 @@ def test_sqlite_timestamp_year(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%Y', timestamp) AS INTEGER)=2024"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%Y', timestamp) AS INTEGER)=2024"
+        ]
     )
 
 
 # ==================== Comparison Modifier Tests ====================
+
 
 def test_sqlite_compare_gt(sqlite_backend: sqliteBackend):
     """Test greater than comparison modifier"""
@@ -827,6 +850,7 @@ def test_sqlite_compare_lte(sqlite_backend: sqliteBackend):
 
 # ==================== All Modifier Tests ====================
 
+
 def test_sqlite_all_modifier(sqlite_backend: sqliteBackend):
     """Test all modifier - all values must match"""
     assert (
@@ -871,11 +895,14 @@ def test_sqlite_all_contains_modifier(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE '%part1%' ESCAPE '\\' AND fieldA LIKE '%part2%' ESCAPE '\\'"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE '%part1%' ESCAPE '\\' AND fieldA LIKE '%part2%' ESCAPE '\\'"
+        ]
     )
 
 
 # ==================== Null Value Tests ====================
+
 
 def test_sqlite_null_value(sqlite_backend: sqliteBackend):
     """Test null value detection"""
@@ -901,6 +928,7 @@ def test_sqlite_null_value(sqlite_backend: sqliteBackend):
 
 # ==================== Boolean Value Tests ====================
 
+
 def test_sqlite_boolean_true(sqlite_backend: sqliteBackend):
     """Test boolean true value"""
     assert (
@@ -919,7 +947,7 @@ def test_sqlite_boolean_true(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA=true"]
+        == ["SELECT * FROM <TABLE_NAME> WHERE (fieldA='true' OR fieldA=1)"]
     )
 
 
@@ -941,11 +969,12 @@ def test_sqlite_boolean_false(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA=false"]
+        == ["SELECT * FROM <TABLE_NAME> WHERE (fieldA='false' OR fieldA=0)"]
     )
 
 
 # ==================== Correlation Tests ====================
+
 
 def test_sqlite_correlation_event_count_basic(sqlite_backend: sqliteBackend):
     """Test basic event count correlation"""
@@ -973,7 +1002,7 @@ def test_sqlite_correlation_event_count_basic(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT *, COUNT(*) AS event_count FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING event_count >= 10"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT *, COUNT(*) OVER (ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 300 FOLLOWING) AS event_count FROM sigma_matched) AS sigma_correlated WHERE event_count >= 10"
     ]
 
 
@@ -1005,7 +1034,7 @@ def test_sqlite_correlation_event_count_with_groupby(sqlite_backend: sqliteBacke
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT SourceIP, COUNT(*) AS event_count FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery GROUP BY SourceIP HAVING event_count >= 5"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT SourceIP FROM (SELECT SourceIP, COUNT(*) OVER (PARTITION BY SourceIP ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 300 FOLLOWING) AS event_count FROM sigma_matched) AS sigma_correlated WHERE event_count >= 5"
     ]
 
 
@@ -1036,7 +1065,7 @@ def test_sqlite_correlation_value_count(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT *, COUNT(DISTINCT TargetUserName) AS value_count FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_count >= 3"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT sigma_anchor.*, (SELECT COUNT(DISTINCT sigma_window.TargetUserName) FROM sigma_matched AS sigma_window WHERE CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS value_count FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE value_count >= 3"
     ]
 
 
@@ -1079,7 +1108,7 @@ def test_sqlite_correlation_temporal(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT TargetUserName, COUNT(DISTINCT sigma_rule_id) AS rule_count, MIN(timestamp) AS first_event, MAX(timestamp) AS last_event FROM (SELECT *, 'rule_a' AS sigma_rule_id FROM logs WHERE EventID=1234 UNION ALL SELECT *, 'rule_b' AS sigma_rule_id FROM logs WHERE EventID=1234) AS subquery GROUP BY TargetUserName HAVING rule_count >= 2 AND (julianday(last_event) - julianday(first_event)) * 86400 <= 300"
+        "WITH sigma_matched AS (SELECT *, 'rule_a' AS sigma_rule_id FROM logs WHERE EventID=1234 UNION ALL SELECT *, 'rule_b' AS sigma_rule_id FROM logs WHERE EventID=1234) SELECT DISTINCT TargetUserName FROM (SELECT sigma_anchor.TargetUserName, (SELECT COUNT(DISTINCT sigma_window.sigma_rule_id) FROM sigma_matched AS sigma_window WHERE sigma_window.TargetUserName = sigma_anchor.TargetUserName AND CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS rule_count FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE rule_count >= 2"
     ]
 
 
@@ -1110,7 +1139,7 @@ def test_sqlite_correlation_value_sum(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT *, SUM(BytesSent) AS value_sum FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_sum >= 1000000"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT *, SUM(BytesSent) OVER (ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 3600 FOLLOWING) AS value_sum FROM sigma_matched) AS sigma_correlated WHERE value_sum >= 1000000"
     ]
 
 
@@ -1141,7 +1170,7 @@ def test_sqlite_correlation_value_avg(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT *, AVG(BytesSent) AS value_avg FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_avg >= 50000"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT *, AVG(BytesSent) OVER (ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 3600 FOLLOWING) AS value_avg FROM sigma_matched) AS sigma_correlated WHERE value_avg >= 50000"
     ]
 
 
@@ -1173,7 +1202,7 @@ def test_sqlite_correlation_value_percentile(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT *, (SELECT Bytes FROM (SELECT * FROM logs WHERE EventID=1234) ORDER BY Bytes LIMIT 1 OFFSET (SELECT COUNT(*) * 95 / 100 FROM (SELECT * FROM logs WHERE EventID=1234))) AS value_percentile FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_percentile >= 1000"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT sigma_anchor.*, (SELECT MIN(sigma_ranked.Bytes) FROM (SELECT sigma_window.Bytes AS Bytes, ROW_NUMBER() OVER (ORDER BY sigma_window.Bytes) AS sigma_rank, COUNT(*) OVER () AS sigma_rank_total FROM sigma_matched AS sigma_window WHERE CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS sigma_ranked WHERE sigma_ranked.sigma_rank * 100 >= sigma_ranked.sigma_rank_total * 95) AS value_percentile FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE value_percentile >= 1000"
     ]
 
 
@@ -1204,11 +1233,12 @@ def test_sqlite_correlation_value_median(sqlite_backend: sqliteBackend):
     """
     )
     assert sqlite_backend.convert(rules) == [
-        "SELECT *, (SELECT AVG(Bytes) FROM (SELECT Bytes FROM (SELECT * FROM logs WHERE EventID=1234) ORDER BY Bytes LIMIT 2 - (SELECT COUNT(*) FROM (SELECT * FROM logs WHERE EventID=1234)) % 2 OFFSET (SELECT (COUNT(*) - 1) / 2 FROM (SELECT * FROM logs WHERE EventID=1234)))) AS value_median FROM (SELECT * FROM logs WHERE EventID=1234) AS subquery HAVING value_median >= 500"
+        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT sigma_anchor.*, (SELECT AVG(sigma_ranked.Bytes) FROM (SELECT sigma_window.Bytes AS Bytes, ROW_NUMBER() OVER (ORDER BY sigma_window.Bytes) AS sigma_rank, COUNT(*) OVER () AS sigma_rank_total FROM sigma_matched AS sigma_window WHERE CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS sigma_ranked WHERE sigma_ranked.sigma_rank IN ((sigma_ranked.sigma_rank_total + 1) / 2, (sigma_ranked.sigma_rank_total + 2) / 2)) AS value_median FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE value_median >= 500"
     ]
 
 
 # ==================== Additional Modifier Tests ====================
+
 
 def test_sqlite_exists_modifier(sqlite_backend: sqliteBackend):
     """Test exists modifier - field must exist (not null)"""
@@ -1228,7 +1258,7 @@ def test_sqlite_exists_modifier(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA = fieldA"]
+        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA IS NOT NULL"]
     )
 
 
@@ -1252,7 +1282,9 @@ def test_sqlite_not_condition(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT fieldB='valueB')"]
+        == [
+            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT COALESCE((fieldB='valueB'), 0))"
+        ]
     )
 
 
@@ -1274,7 +1306,7 @@ def test_sqlite_neq_single_value(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE NOT fieldA='valueA'"]
+        == ["SELECT * FROM <TABLE_NAME> WHERE NOT COALESCE((fieldA='valueA'), 0)"]
     )
 
 
@@ -1299,7 +1331,7 @@ def test_sqlite_neq_multi_value(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE NOT (fieldA='val1' OR fieldA='val2')"
+            "SELECT * FROM <TABLE_NAME> WHERE NOT COALESCE((fieldA='val1' OR fieldA='val2'), 0)"
         ]
     )
 
@@ -1327,7 +1359,7 @@ def test_sqlite_wildcard_filter_pattern(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT (fieldB LIKE 'valueB%' ESCAPE '\\' OR fieldC='valueC'))"
+            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT COALESCE((fieldB LIKE 'valueB%' ESCAPE '\\' OR fieldC='valueC'), 0))"
         ]
     )
 
@@ -1361,11 +1393,10 @@ def test_sqlite_custom_timestamp_field():
     """
     )
     result = backend.convert(rules)
-    # Verify the custom timestamp field is used instead of the default 'timestamp'
-    assert "MIN(event_time)" in result[0]
-    assert "MAX(event_time)" in result[0]
-    assert "MIN(timestamp)" not in result[0]
-    assert "MAX(timestamp)" not in result[0]
+    # The window arithmetic must read the configured field, not the default one
+    assert "strftime('%s', sigma_anchor.event_time)" in result[0]
+    assert "strftime('%s', sigma_window.event_time)" in result[0]
+    assert "timestamp" not in result[0]
 
 
 def test_sqlite_table_name_from_setstate_pipeline():
@@ -1374,7 +1405,9 @@ def test_sqlite_table_name_from_setstate_pipeline():
     from sigma.processing.transformations import SetStateTransformation
 
     pipeline = ProcessingPipeline(
-        items=[ProcessingItem(transformation=SetStateTransformation("table", "my_events"))]
+        items=[
+            ProcessingItem(transformation=SetStateTransformation("table", "my_events"))
+        ]
     )
     backend = sqliteBackend(processing_pipeline=pipeline)
 
@@ -1422,3 +1455,499 @@ def test_sqlite_table_name_from_setstate_pipeline():
     result = backend.convert(correlation)
     assert "FROM my_events" in result[0]
     assert "FROM logs" not in result[0]
+
+
+# ==================== Behavioural tests ====================
+#
+# Everything above compares query text. These run the generated SQL against a database shaped
+# like the one Zircolite builds -- every column TEXT/INTEGER COLLATE NOCASE, a regexp() user
+# function, and events that simply lack fields -- and assert which rows come back. Sigma reads
+# a condition on an absent field as false; SQL reads it as NULL, and the difference is only
+# visible when the query actually runs.
+
+EVENTS = [
+    # row_id, Channel, EventID, CommandLine, Image, Flag, FlagNum, User
+    (1, "Security", 4688, None, "C:\\Windows\\System32\\cmd.exe", "true", 1, "alice"),
+    (
+        2,
+        "Security",
+        4688,
+        "foo.exe -x",
+        "C:\\Windows\\System32\\cmd.exe",
+        "false",
+        0,
+        "bob",
+    ),
+    (
+        3,
+        "Microsoft-Windows-Sysmon/Operational",
+        3,
+        "bar.exe",
+        "a*b",
+        "true",
+        1,
+        "alice",
+    ),
+    (
+        4,
+        "Microsoft-Windows-Sysmon/Operational",
+        3,
+        "baz.exe",
+        "axb",
+        "true",
+        1,
+        "alice",
+    ),
+]
+
+
+def make_db():
+    """An in-memory table shaped like Zircolite's: NOCASE columns and a regexp() function."""
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    connection.create_function(
+        # Mirrors zircolite/core.py: a regexp against a missing field is false, not an error.
+        "regexp",
+        2,
+        lambda pattern, value: (
+            0
+            if value is None
+            else (1 if __import__("re").search(pattern, str(value)) else 0)
+        ),
+    )
+    connection.execute(
+        "CREATE TABLE logs ("
+        "row_id INTEGER PRIMARY KEY, "
+        "Channel TEXT COLLATE NOCASE, "
+        "EventID INTEGER COLLATE NOCASE, "
+        "CommandLine TEXT COLLATE NOCASE, "
+        "Image TEXT COLLATE NOCASE, "
+        "Flag TEXT COLLATE NOCASE, "
+        "FlagNum INTEGER COLLATE NOCASE, "
+        "User TEXT COLLATE NOCASE)"
+    )
+    connection.executemany("INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?, ?)", EVENTS)
+    return connection
+
+
+def matching_rows(detection: str, backend: sqliteBackend = None) -> set:
+    """Row ids returned by the rule's query, run against the fixture database."""
+    backend = backend or sqliteBackend()
+    backend.table = "logs"
+    query = backend.convert(
+        SigmaCollection.from_yaml(
+            "title: Test\nstatus: test\n"
+            "logsource:\n    product: windows\n"
+            "detection:\n" + detection
+        )
+    )[0].replace("SELECT *", "SELECT row_id", 1)
+    with make_db() as connection:
+        return {row[0] for row in connection.execute(query)}
+
+
+def test_behaviour_negated_filter_keeps_event_lacking_the_field():
+    """The Zircolite 4.0 fix: row 1 has no CommandLine, so "not filter" must not hide it."""
+    assert matching_rows(
+        "    sel:\n        EventID: 4688\n"
+        "    filter:\n        CommandLine|contains: 'foo'\n"
+        "    condition: sel and not filter\n"
+    ) == {1}
+
+
+def test_behaviour_nested_negation_on_absent_field():
+    """not (a and not b) with b absent: Sigma reads b as false, so the inner not is true."""
+    assert matching_rows(
+        "    sel:\n        EventID: 4688\n"
+        "    a:\n        Image|contains: 'cmd.exe'\n"
+        "    b:\n        CommandLine|contains: 'foo'\n"
+        "    condition: sel and not (a and not b)\n"
+    ) == {2}
+
+
+def test_behaviour_negated_regexp_on_absent_field():
+    assert matching_rows(
+        "    sel:\n        EventID: 4688\n"
+        "    filter:\n        CommandLine|re: 'foo'\n"
+        "    condition: sel and not filter\n"
+    ) == {1}
+
+
+def test_behaviour_exists_true_and_false():
+    assert matching_rows(
+        "    sel:\n        CommandLine|exists: true\n    condition: sel\n"
+    ) == {2, 3, 4}
+    assert matching_rows(
+        "    sel:\n        CommandLine|exists: false\n    condition: sel\n"
+    ) == {1}
+
+
+def test_behaviour_neq_matches_event_lacking_the_field():
+    assert matching_rows(
+        "    sel:\n        CommandLine|neq: 'foo.exe -x'\n    condition: sel\n"
+    ) == {1, 3, 4}
+
+
+def test_behaviour_boolean_matches_text_and_numeric_storage():
+    """Zircolite stores 'true'; a hand-built table is as likely to hold 1."""
+    assert matching_rows("    sel:\n        Flag: true\n    condition: sel\n") == {
+        1,
+        3,
+        4,
+    }
+    assert matching_rows("    sel:\n        FlagNum: true\n    condition: sel\n") == {
+        1,
+        3,
+        4,
+    }
+    assert matching_rows("    sel:\n        Flag: false\n    condition: sel\n") == {2}
+    assert matching_rows("    sel:\n        FlagNum: false\n    condition: sel\n") == {
+        2
+    }
+
+
+def test_behaviour_cased_literal_glob_metacharacter():
+    """A literal "*" in a |cased value must not act as a glob wildcard."""
+    assert matching_rows(
+        "    sel:\n        Image|cased: 'a\\*b'\n    condition: sel\n"
+    ) == {3}
+    assert matching_rows(
+        "    sel:\n        Image|cased: 'a*b'\n    condition: sel\n"
+    ) == {3, 4}
+
+
+def test_behaviour_equality_is_case_insensitive_on_nocase_columns():
+    """Sigma matches case-insensitively; Zircolite provides that with COLLATE NOCASE columns."""
+    assert matching_rows("    sel:\n        User: 'ALICE'\n    condition: sel\n") == {
+        1,
+        3,
+        4,
+    }
+
+
+def test_behaviour_collate_nocase_option_on_a_binary_column():
+    """Without NOCASE columns the option is what keeps "=" Sigma-conformant."""
+    import sqlite3
+
+    rule = SigmaCollection.from_yaml(
+        "title: Test\nstatus: test\nlogsource:\n    product: windows\n"
+        "detection:\n    sel:\n        User: 'ALICE'\n    condition: sel\n"
+    )
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE logs (row_id INTEGER PRIMARY KEY, User TEXT)")
+    connection.execute("INSERT INTO logs VALUES (1, 'alice')")
+
+    plain = sqliteBackend()
+    plain.table = "logs"
+    assert connection.execute(plain.convert(rule)[0]).fetchall() == []
+
+    collating = sqliteBackend()
+    collating.table = "logs"
+    collating.collate_nocase = True
+    assert connection.execute(collating.convert(rule)[0]).fetchall() == [(1, "alice")]
+
+
+def test_behaviour_deep_or_chain_is_accepted_by_sqlite():
+    """A flat chain of this length exceeds SQLITE_MAX_EXPR_DEPTH and never matched anything."""
+    values = "".join(f"            - v{index}\n" for index in range(5000))
+    assert (
+        matching_rows(
+            "    sel:\n        CommandLine|contains:\n"
+            + values
+            + "    condition: sel\n"
+        )
+        == set()
+    )
+
+
+def test_fieldref_like_metacharacters_from_the_event_are_literal():
+    """fieldref compares two fields, so a "%" in the second must not become a wildcard."""
+    import sqlite3
+
+    query = (
+        sqliteBackend()
+        .convert(
+            SigmaCollection.from_yaml(
+                "title: Test\nstatus: test\nlogsource:\n    product: windows\n"
+                "detection:\n    sel:\n        a|fieldref|contains: b\n    condition: sel\n"
+            )
+        )[0]
+        .replace("<TABLE_NAME>", "t")
+        .replace("SELECT *", "SELECT row_id", 1)
+    )
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE t (row_id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    connection.executemany(
+        "INSERT INTO t VALUES (?, ?, ?)",
+        [
+            (1, "x1%0y", "1%0"),
+            (2, "x100y", "1%0"),
+            (3, "abc", "a_c"),
+            (4, "a_c", "a_c"),
+        ],
+    )
+    assert {row[0] for row in connection.execute(query)} == {1, 4}
+
+
+# ---- Zircolite rule metadata ----
+
+
+def zircolite_rule(detection: str) -> dict:
+    import json
+
+    return json.loads(
+        sqliteBackend().convert(
+            SigmaCollection.from_yaml(
+                "title: Test\nstatus: test\nlogsource:\n    product: windows\n"
+                "detection:\n" + detection
+            ),
+            "zircolite",
+        )
+    )[0]
+
+
+def test_zircolite_metadata_ignores_negated_channel():
+    """Zircolite reads these as an allow-list; a channel the rule excludes would starve it."""
+    rule = zircolite_rule(
+        "    sel:\n        EventID: 4688\n"
+        "    filter:\n        Channel: 'Noise'\n"
+        "    condition: sel and not filter\n"
+    )
+    assert rule["channel"] == []
+    assert rule["eventid"] == [4688]
+
+
+def test_zircolite_metadata_ignores_wildcard_channel():
+    rule = zircolite_rule(
+        "    sel:\n        Channel|contains: 'Sysmon'\n        EventID: 1\n    condition: sel\n"
+    )
+    assert rule["channel"] == []
+    assert rule["eventid"] == [1]
+
+
+def test_zircolite_metadata_keeps_the_event_ids_the_rule_wants():
+    rule = zircolite_rule(
+        "    sel:\n        Channel: Security\n        EventID:\n            - 4624\n            - 4625\n"
+        "    filter:\n        EventID: 4624\n"
+        "    condition: sel and not filter\n"
+    )
+    assert rule["channel"] == ["Security"]
+    assert rule["eventid"] == [4624, 4625]
+
+
+def test_zircolite_metadata_unbounded_when_an_or_branch_is():
+    rule = zircolite_rule(
+        "    sel1:\n        Channel: Security\n        EventID: 4624\n"
+        "    sel2:\n        EventID: 1\n"
+        "    condition: sel1 or sel2\n"
+    )
+    assert rule["channel"] == []
+    assert rule["eventid"] == [1, 4624]
+
+
+def test_zircolite_correlation_rule_is_marked():
+    import json
+
+    rules = SigmaCollection.from_yaml(
+        """
+        title: Base Rule
+        name: base_rule
+        status: test
+        logsource:
+            category: test_category
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: Correlation
+        status: test
+        correlation:
+            type: event_count
+            rules: base_rule
+            timespan: 5m
+            condition:
+                gte: 10
+    """
+    )
+    converted = json.loads(sqliteBackend().convert(rules, "zircolite"))
+    assert converted[-1]["correlation"] is True
+    assert converted[-1]["channel"] == []
+    assert converted[-1]["eventid"] == []
+
+
+# ---- correlation behaviour ----
+
+CORRELATION_BASE = """
+        title: A
+        name: rule_a
+        status: test
+        logsource:
+            category: test_category
+        detection:
+            sel:
+                EventID: 1234
+            condition: sel
+---
+        title: B
+        name: rule_b
+        status: test
+        logsource:
+            category: test_category
+        detection:
+            sel:
+                EventID: 5678
+            condition: sel
+---
+"""
+
+CORRELATION_EVENTS = (
+    # a burst of ten events inside five minutes, and twelve spread over an hour
+    [
+        (f"2024-01-01T11:0{index // 2}:00", "burst", f"u{index}", 100, 1234)
+        for index in range(10)
+    ]
+    + [("2024-01-01T10:00:00", "spread", f"u{index}", 10, 1234) for index in range(6)]
+    + [("2024-01-01T10:59:00", "spread", f"u{index}", 10, 1234) for index in range(6)]
+    # rule_a then rule_b for "ordered", the reverse for "reversed"
+    + [
+        ("2024-01-02T10:00:00", "ordered", "x", 1, 1234),
+        ("2024-01-02T10:01:00", "ordered", "x", 1, 5678),
+    ]
+    + [
+        ("2024-01-02T10:00:00", "reversed", "x", 1, 5678),
+        ("2024-01-02T10:01:00", "reversed", "x", 1, 1234),
+    ]
+)
+
+
+def correlation_groups(correlation: str) -> set:
+    """Groups selected by the correlation query, run against CORRELATION_EVENTS."""
+    import sqlite3
+
+    query = sqliteBackend(correlation_methods=["default"]).convert(
+        SigmaCollection.from_yaml(CORRELATION_BASE + correlation)
+    )[-1]
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE logs (timestamp TEXT COLLATE NOCASE, Host TEXT COLLATE NOCASE, "
+        "User TEXT COLLATE NOCASE, Bytes INTEGER, EventID INTEGER)"
+    )
+    connection.executemany(
+        "INSERT INTO logs VALUES (?, ?, ?, ?, ?)", CORRELATION_EVENTS
+    )
+    return {row[0] for row in connection.execute(query)}
+
+
+@pytest.mark.parametrize(
+    "correlation_type,condition,expected",
+    [
+        # "spread" has twelve events, but never ten inside one five-minute window
+        ("event_count", "gte: 10", {"burst"}),
+        ("value_count", "gte: 10\n                field: User", {"burst"}),
+        ("value_sum", "gte: 1000\n                field: Bytes", {"burst"}),
+        ("value_avg", "gte: 50\n                field: Bytes", {"burst"}),
+        ("value_median", "gte: 50\n                field: Bytes", {"burst"}),
+        (
+            "value_percentile",
+            "gte: 100\n                field: Bytes\n                percentile: 95",
+            {"burst"},
+        ),
+    ],
+)
+def test_correlation_honours_the_timespan(correlation_type, condition, expected):
+    assert (
+        correlation_groups(
+            f"""
+        title: Correlation
+        status: test
+        correlation:
+            type: {correlation_type}
+            rules: rule_a
+            group-by: Host
+            timespan: 5m
+            condition:
+                {condition}
+    """
+        )
+        == expected
+    )
+
+
+def test_correlation_temporal_ignores_order():
+    assert (
+        correlation_groups(
+            """
+        title: Correlation
+        status: test
+        correlation:
+            type: temporal
+            rules:
+                - rule_a
+                - rule_b
+            group-by: Host
+            timespan: 5m
+    """
+        )
+        == {"ordered", "reversed"}
+    )
+
+
+def test_correlation_temporal_ordered_enforces_order():
+    """Without the ordering test this type was indistinguishable from plain temporal."""
+    assert (
+        correlation_groups(
+            """
+        title: Correlation
+        status: test
+        correlation:
+            type: temporal_ordered
+            rules:
+                - rule_a
+                - rule_b
+            group-by: Host
+            timespan: 5m
+    """
+        )
+        == {"ordered"}
+    )
+
+
+def test_correlation_temporal_extended_condition():
+    assert (
+        correlation_groups(
+            """
+        title: Correlation
+        status: test
+        correlation:
+            type: temporal
+            rules:
+                - rule_a
+                - rule_b
+            group-by: Host
+            timespan: 5m
+            condition: rule_a and not rule_b
+    """
+        )
+        == {"burst", "spread", "reversed"}
+    )
+
+
+def test_correlation_temporal_ordered_extended_condition():
+    assert (
+        correlation_groups(
+            """
+        title: Correlation
+        status: test
+        correlation:
+            type: temporal_ordered
+            rules:
+                - rule_a
+                - rule_b
+            group-by: Host
+            timespan: 5m
+            condition: rule_a and rule_b
+    """
+        )
+        == {"ordered"}
+    )
