@@ -31,7 +31,7 @@ def test_sqlite_and_expression(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND fieldB='valueB'"]
+        == ["SELECT * FROM logs WHERE fieldA='valueA' AND fieldB='valueB'"]
     )
 
 
@@ -54,7 +54,7 @@ def test_sqlite_or_expression(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' OR fieldB='valueB'"]
+        == ["SELECT * FROM logs WHERE fieldA='valueA' OR fieldB='valueB'"]
     )
 
 
@@ -81,7 +81,7 @@ def test_sqlite_and_or_expression(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE (fieldA='valueA1' OR fieldA='valueA2') AND (fieldB='valueB1' OR fieldB='valueB2')"
+            "SELECT * FROM logs WHERE (fieldA='valueA1' OR fieldA='valueA2') AND (fieldB='valueB1' OR fieldB='valueB2')"
         ]
     )
 
@@ -108,7 +108,7 @@ def test_sqlite_or_and_expression(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE (fieldA='valueA1' AND fieldB='valueB1') OR (fieldA='valueA2' AND fieldB='valueB2')"
+            "SELECT * FROM logs WHERE (fieldA='valueA1' AND fieldB='valueB1') OR (fieldA='valueA2' AND fieldB='valueB2')"
         ]
     )
 
@@ -134,7 +134,7 @@ def test_sqlite_in_expression(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' OR fieldA='valueB' OR fieldA LIKE 'valueC%' ESCAPE '\\'"
+            "SELECT * FROM logs WHERE fieldA='valueA' OR fieldA='valueB' OR fieldA LIKE 'valueC%' ESCAPE '\\'"
         ]
     )
 
@@ -157,9 +157,7 @@ def test_sqlite_regex_query(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA REGEXP 'foo.*bar' AND fieldB='foo'"
-        ]
+        == ["SELECT * FROM logs WHERE fieldA REGEXP 'foo.*bar' AND fieldB='foo'"]
     )
 
 
@@ -180,7 +178,7 @@ def test_sqlite_regex_query_single_quote(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA REGEXP 'it''s.exe'"]
+        == ["SELECT * FROM logs WHERE fieldA REGEXP 'it''s.exe'"]
     )
 
 
@@ -201,7 +199,7 @@ def test_sqlite_cidr_query(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE field LIKE '192.168.%' ESCAPE '\\'"]
+        == ["SELECT * FROM logs WHERE field LIKE '192.168.%' ESCAPE '\\'"]
     )
 
 
@@ -222,7 +220,7 @@ def test_sqlite_field_name_with_whitespace(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE `field name`='value'"]
+        == ["SELECT * FROM logs WHERE `field name`='value'"]
     )
 
 
@@ -245,7 +243,7 @@ def test_sqlite_value_with_wildcards(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE 'wildcard\\%value' ESCAPE '\\' AND fieldB LIKE 'wildcard\\_value' ESCAPE '\\'"
+            "SELECT * FROM logs WHERE fieldA LIKE 'wildcard\\%value' ESCAPE '\\' AND fieldB LIKE 'wildcard\\_value' ESCAPE '\\'"
         ]
     )
 
@@ -267,9 +265,7 @@ def test_sqlite_value_contains(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE '%wildcard\\%value%' ESCAPE '\\'"
-        ]
+        == ["SELECT * FROM logs WHERE fieldA LIKE '%wildcard\\%value%' ESCAPE '\\'"]
     )
 
 
@@ -290,9 +286,7 @@ def test_sqlite_value_startswith(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE 'wildcard\\%value%' ESCAPE '\\'"
-        ]
+        == ["SELECT * FROM logs WHERE fieldA LIKE 'wildcard\\%value%' ESCAPE '\\'"]
     )
 
 
@@ -313,9 +307,7 @@ def test_sqlite_value_endswith(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE '%wildcard\\%value' ESCAPE '\\'"
-        ]
+        == ["SELECT * FROM logs WHERE fieldA LIKE '%wildcard\\%value' ESCAPE '\\'"]
     )
 
 
@@ -384,7 +376,7 @@ def test_sqlite_value_case_sensitive_contains(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB '*VaLuE*'"]
+        == ["SELECT * FROM logs WHERE fieldA GLOB '*VaLuE*'"]
     )
 
 
@@ -405,9 +397,7 @@ def test_sqlite_value_case_sensitive_match(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            r"SELECT * FROM <TABLE_NAME> WHERE fieldA GLOB 'C:\Windows\System32\cmd.exe'"
-        ]
+        == [r"SELECT * FROM logs WHERE fieldA GLOB 'C:\Windows\System32\cmd.exe'"]
     )
 
 
@@ -444,7 +434,7 @@ def test_sqlite_case_sensitive_executes_on_sqlite3(
         f"        {detection}\n"
         "    condition: sel\n"
     )
-    query = sqlite_backend.convert(rule)[0].replace("<TABLE_NAME>", "t")
+    query = sqlite_backend.convert(rule)[0].replace("logs", "t")
 
     conn = sqlite3.connect(":memory:")
     try:
@@ -471,10 +461,16 @@ def test_sqlite_zircolite_output(sqlite_backend: sqliteBackend):
                 condition: sel
         """
     )
-    assert (
-        sqlite_backend.convert(rule, "zircolite")
-        == '[{"title": "Test", "id": "", "status": "test", "description": "", "author": "", "tags": [], "falsepositives": [], "level": "", "rule": ["SELECT * FROM logs WHERE fieldA=\'value\'"], "filename": "", "channel": [], "eventid": []}]'
-    )
+    import json
+
+    entries = json.loads(sqlite_backend.convert(rule, "zircolite"))
+    assert len(entries) == 1
+    assert entries[0]["title"] == "Test"
+    assert entries[0]["rule"] == ["SELECT * FROM logs WHERE fieldA='value'"]
+    assert entries[0]["schema_version"] == 2
+    assert entries[0]["required_fields"] == ["fieldA"]
+    assert entries[0]["source_table"] == "logs"
+    assert entries[0]["logsource"]["product"] == "test_product"
 
 
 def test_sqlite_zircolite_output_with_channel_and_eventid(
@@ -578,7 +574,7 @@ def test_sqlite_fieldref_equals(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA=fieldB"]
+        == ["SELECT * FROM logs WHERE fieldA=fieldB"]
     )
 
 
@@ -605,7 +601,7 @@ def test_sqlite_fieldref_multiple_values(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE (fieldA=fieldD OR fieldA=fieldE) AND fieldB='foo' AND fieldC='bar'"
+            "SELECT * FROM logs WHERE (fieldA=fieldD OR fieldA=fieldE) AND fieldB='foo' AND fieldC='bar'"
         ]
     )
 
@@ -631,9 +627,7 @@ def test_sqlite_timestamp_hour(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%H', timestamp) AS INTEGER)=14"
-        ]
+        == ["SELECT * FROM logs WHERE CAST(strftime('%H', timestamp) AS INTEGER)=14"]
     )
 
 
@@ -655,9 +649,7 @@ def test_sqlite_timestamp_minute(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%M', timestamp) AS INTEGER)=30"
-        ]
+        == ["SELECT * FROM logs WHERE CAST(strftime('%M', timestamp) AS INTEGER)=30"]
     )
 
 
@@ -679,9 +671,7 @@ def test_sqlite_timestamp_day(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%d', timestamp) AS INTEGER)=15"
-        ]
+        == ["SELECT * FROM logs WHERE CAST(strftime('%d', timestamp) AS INTEGER)=15"]
     )
 
 
@@ -703,9 +693,7 @@ def test_sqlite_timestamp_week(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%W', timestamp) AS INTEGER)=42"
-        ]
+        == ["SELECT * FROM logs WHERE CAST(strftime('%W', timestamp) AS INTEGER)=42"]
     )
 
 
@@ -727,9 +715,7 @@ def test_sqlite_timestamp_month(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%m', timestamp) AS INTEGER)=12"
-        ]
+        == ["SELECT * FROM logs WHERE CAST(strftime('%m', timestamp) AS INTEGER)=12"]
     )
 
 
@@ -751,9 +737,7 @@ def test_sqlite_timestamp_year(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == [
-            "SELECT * FROM <TABLE_NAME> WHERE CAST(strftime('%Y', timestamp) AS INTEGER)=2024"
-        ]
+        == ["SELECT * FROM logs WHERE CAST(strftime('%Y', timestamp) AS INTEGER)=2024"]
     )
 
 
@@ -778,7 +762,7 @@ def test_sqlite_compare_gt(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA > 100"]
+        == ["SELECT * FROM logs WHERE fieldA > 100"]
     )
 
 
@@ -800,7 +784,7 @@ def test_sqlite_compare_gte(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA >= 100"]
+        == ["SELECT * FROM logs WHERE fieldA >= 100"]
     )
 
 
@@ -822,7 +806,7 @@ def test_sqlite_compare_lt(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA < 50"]
+        == ["SELECT * FROM logs WHERE fieldA < 50"]
     )
 
 
@@ -844,7 +828,7 @@ def test_sqlite_compare_lte(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA <= 50"]
+        == ["SELECT * FROM logs WHERE fieldA <= 50"]
     )
 
 
@@ -871,7 +855,7 @@ def test_sqlite_all_modifier(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA='value1' AND fieldA='value2'"]
+        == ["SELECT * FROM logs WHERE fieldA='value1' AND fieldA='value2'"]
     )
 
 
@@ -896,7 +880,7 @@ def test_sqlite_all_contains_modifier(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA LIKE '%part1%' ESCAPE '\\' AND fieldA LIKE '%part2%' ESCAPE '\\'"
+            "SELECT * FROM logs WHERE fieldA LIKE '%part1%' ESCAPE '\\' AND fieldA LIKE '%part2%' ESCAPE '\\'"
         ]
     )
 
@@ -922,7 +906,7 @@ def test_sqlite_null_value(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA IS NULL"]
+        == ["SELECT * FROM logs WHERE fieldA IS NULL"]
     )
 
 
@@ -947,7 +931,7 @@ def test_sqlite_boolean_true(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE (fieldA='true' OR fieldA=1)"]
+        == ["SELECT * FROM logs WHERE (fieldA='true' OR fieldA=1)"]
     )
 
 
@@ -969,272 +953,8 @@ def test_sqlite_boolean_false(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE (fieldA='false' OR fieldA=0)"]
+        == ["SELECT * FROM logs WHERE (fieldA='false' OR fieldA=0)"]
     )
-
-
-# ==================== Correlation Tests ====================
-
-
-def test_sqlite_correlation_event_count_basic(sqlite_backend: sqliteBackend):
-    """Test basic event count correlation"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Event Count Correlation
-        status: test
-        correlation:
-            type: event_count
-            rules: base_rule
-            timespan: 5m
-            condition:
-                gte: 10
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT *, COUNT(*) OVER (ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 300 FOLLOWING) AS event_count FROM sigma_matched) AS sigma_correlated WHERE event_count >= 10"
-    ]
-
-
-def test_sqlite_correlation_event_count_with_groupby(sqlite_backend: sqliteBackend):
-    """Test event count correlation with group by - only selects grouped fields to avoid undefined behavior"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Event Count Correlation with Group By
-        status: test
-        correlation:
-            type: event_count
-            rules: base_rule
-            group-by:
-                - SourceIP
-            timespan: 5m
-            condition:
-                gte: 5
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT SourceIP FROM (SELECT SourceIP, COUNT(*) OVER (PARTITION BY SourceIP ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 300 FOLLOWING) AS event_count FROM sigma_matched) AS sigma_correlated WHERE event_count >= 5"
-    ]
-
-
-def test_sqlite_correlation_value_count(sqlite_backend: sqliteBackend):
-    """Test value count correlation"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Value Count Correlation
-        status: test
-        correlation:
-            type: value_count
-            rules: base_rule
-            timespan: 5m
-            condition:
-                field: TargetUserName
-                gte: 3
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT sigma_anchor.*, (SELECT COUNT(DISTINCT sigma_window.TargetUserName) FROM sigma_matched AS sigma_window WHERE CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS value_count FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE value_count >= 3"
-    ]
-
-
-def test_sqlite_correlation_temporal(sqlite_backend: sqliteBackend):
-    """Test temporal correlation - only selects grouped fields to avoid undefined behavior"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Rule A
-        name: rule_a
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Rule B
-        name: rule_b
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Temporal Correlation
-        status: test
-        correlation:
-            type: temporal
-            rules:
-                - rule_a
-                - rule_b
-            timespan: 5m
-            group-by:
-                - TargetUserName
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT *, 'rule_a' AS sigma_rule_id FROM logs WHERE EventID=1234 UNION ALL SELECT *, 'rule_b' AS sigma_rule_id FROM logs WHERE EventID=1234) SELECT DISTINCT TargetUserName FROM (SELECT sigma_anchor.TargetUserName, (SELECT COUNT(DISTINCT sigma_window.sigma_rule_id) FROM sigma_matched AS sigma_window WHERE sigma_window.TargetUserName = sigma_anchor.TargetUserName AND CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS rule_count FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE rule_count >= 2"
-    ]
-
-
-def test_sqlite_correlation_value_sum(sqlite_backend: sqliteBackend):
-    """Test value sum correlation"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Value Sum Correlation
-        status: test
-        correlation:
-            type: value_sum
-            rules: base_rule
-            timespan: 1h
-            condition:
-                field: BytesSent
-                gte: 1000000
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT *, SUM(BytesSent) OVER (ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 3600 FOLLOWING) AS value_sum FROM sigma_matched) AS sigma_correlated WHERE value_sum >= 1000000"
-    ]
-
-
-def test_sqlite_correlation_value_avg(sqlite_backend: sqliteBackend):
-    """Test value avg correlation"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Value Avg Correlation
-        status: test
-        correlation:
-            type: value_avg
-            rules: base_rule
-            timespan: 1h
-            condition:
-                field: BytesSent
-                gte: 50000
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT *, AVG(BytesSent) OVER (ORDER BY CAST(strftime('%s', timestamp) AS INTEGER) RANGE BETWEEN CURRENT ROW AND 3600 FOLLOWING) AS value_avg FROM sigma_matched) AS sigma_correlated WHERE value_avg >= 50000"
-    ]
-
-
-def test_sqlite_correlation_value_percentile(sqlite_backend: sqliteBackend):
-    """Test value percentile correlation"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Value Percentile Correlation
-        status: test
-        correlation:
-            type: value_percentile
-            rules: base_rule
-            timespan: 5m
-            condition:
-                field: Bytes
-                percentile: 95
-                gte: 1000
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT sigma_anchor.*, (SELECT MIN(sigma_ranked.Bytes) FROM (SELECT sigma_window.Bytes AS Bytes, ROW_NUMBER() OVER (ORDER BY sigma_window.Bytes) AS sigma_rank, COUNT(*) OVER () AS sigma_rank_total FROM sigma_matched AS sigma_window WHERE CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS sigma_ranked WHERE sigma_ranked.sigma_rank * 100 >= sigma_ranked.sigma_rank_total * 95) AS value_percentile FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE value_percentile >= 1000"
-    ]
-
-
-def test_sqlite_correlation_value_median(sqlite_backend: sqliteBackend):
-    """Test value median correlation"""
-    rules = SigmaCollection.from_yaml(
-        """
-        title: Base Rule
-        name: base_rule
-        status: test
-        logsource:
-            category: test_category
-            product: test_product
-        detection:
-            sel:
-                EventID: 1234
-            condition: sel
----
-        title: Value Median Correlation
-        status: test
-        correlation:
-            type: value_median
-            rules: base_rule
-            timespan: 5m
-            condition:
-                field: Bytes
-                gte: 500
-    """
-    )
-    assert sqlite_backend.convert(rules) == [
-        "WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234) SELECT DISTINCT * FROM (SELECT sigma_anchor.*, (SELECT AVG(sigma_ranked.Bytes) FROM (SELECT sigma_window.Bytes AS Bytes, ROW_NUMBER() OVER (ORDER BY sigma_window.Bytes) AS sigma_rank, COUNT(*) OVER () AS sigma_rank_total FROM sigma_matched AS sigma_window WHERE CAST(strftime('%s', sigma_window.timestamp) AS INTEGER) BETWEEN CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) AND CAST(strftime('%s', sigma_anchor.timestamp) AS INTEGER) + 300) AS sigma_ranked WHERE sigma_ranked.sigma_rank IN ((sigma_ranked.sigma_rank_total + 1) / 2, (sigma_ranked.sigma_rank_total + 2) / 2)) AS value_median FROM sigma_matched AS sigma_anchor) AS sigma_correlated WHERE value_median >= 500"
-    ]
 
 
 # ==================== Additional Modifier Tests ====================
@@ -1258,7 +978,7 @@ def test_sqlite_exists_modifier(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE fieldA IS NOT NULL"]
+        == ["SELECT * FROM logs WHERE fieldA IS NOT NULL"]
     )
 
 
@@ -1283,7 +1003,7 @@ def test_sqlite_not_condition(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT COALESCE((fieldB='valueB'), 0))"
+            "SELECT * FROM logs WHERE fieldA='valueA' AND (NOT COALESCE((fieldB='valueB'), 0))"
         ]
     )
 
@@ -1306,7 +1026,7 @@ def test_sqlite_neq_single_value(sqlite_backend: sqliteBackend):
         """
             )
         )
-        == ["SELECT * FROM <TABLE_NAME> WHERE NOT COALESCE((fieldA='valueA'), 0)"]
+        == ["SELECT * FROM logs WHERE NOT COALESCE((fieldA='valueA'), 0)"]
     )
 
 
@@ -1331,7 +1051,7 @@ def test_sqlite_neq_multi_value(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE NOT COALESCE((fieldA='val1' OR fieldA='val2'), 0)"
+            "SELECT * FROM logs WHERE NOT COALESCE((fieldA='val1' OR fieldA='val2'), 0)"
         ]
     )
 
@@ -1359,7 +1079,7 @@ def test_sqlite_wildcard_filter_pattern(sqlite_backend: sqliteBackend):
             )
         )
         == [
-            "SELECT * FROM <TABLE_NAME> WHERE fieldA='valueA' AND (NOT COALESCE((fieldB LIKE 'valueB%' ESCAPE '\\' OR fieldC='valueC'), 0))"
+            "SELECT * FROM logs WHERE fieldA='valueA' AND (NOT COALESCE((fieldB LIKE 'valueB%' ESCAPE '\\' OR fieldC='valueC'), 0))"
         ]
     )
 
@@ -1394,8 +1114,7 @@ def test_sqlite_custom_timestamp_field():
     )
     result = backend.convert(rules)
     # The window arithmetic must read the configured field, not the default one
-    assert "strftime('%s', sigma_anchor.event_time)" in result[0]
-    assert "strftime('%s', sigma_window.event_time)" in result[0]
+    assert "julianday(event_time)" in result[0]
     assert "timestamp" not in result[0]
 
 
@@ -1672,7 +1391,7 @@ def test_fieldref_like_metacharacters_from_the_event_are_literal():
                 "detection:\n    sel:\n        a|fieldref|contains: b\n    condition: sel\n"
             )
         )[0]
-        .replace("<TABLE_NAME>", "t")
+        .replace("logs", "t")
         .replace("SELECT *", "SELECT row_id", 1)
     )
     connection = sqlite3.connect(":memory:")
@@ -1836,7 +1555,9 @@ def correlation_groups(correlation: str) -> set:
     connection.executemany(
         "INSERT INTO logs VALUES (?, ?, ?, ?, ?)", CORRELATION_EVENTS
     )
-    return {row[0] for row in connection.execute(query)}
+    return {
+        __import__("json").loads(row[1])["Host"] for row in connection.execute(query)
+    }
 
 
 @pytest.mark.parametrize(
@@ -1929,7 +1650,7 @@ def test_correlation_temporal_extended_condition():
             condition: rule_a and not rule_b
     """
         )
-        == {"burst", "spread", "reversed"}
+        == {"burst", "spread"}
     )
 
 

@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         os: [ 'ubuntu-latest' ]
-        python-version: [ '3.10', '3.11', '3.12', '3.13' ]
+        python-version: [ '3.10', '3.11', '3.12', '3.13', '3.14' ]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +23,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: poetry install
+      - name: Build minimum supported SQLite
+        if: matrix.python-version == '3.10'
+        run: |
+          curl --fail --location https://www.sqlite.org/2022/sqlite-amalgamation-3380000.zip --output /tmp/sqlite-min.zip
+          unzip -q /tmp/sqlite-min.zip -d /tmp
+          cd /tmp/sqlite-amalgamation-3380000
+          cc -O2 -DSQLITE_THREADSAFE=0 shell.c sqlite3.c -lm -ldl -o /tmp/sqlite-min
+          echo "SQLITE_MIN_BINARY=/tmp/sqlite-min" >> "$GITHUB_ENV"
       - name: Run tests
         run: poetry run pytest --cov=sigma --cov-report term --cov-report xml:cov.xml -vv
       - name: Store coverage for badge
@@ -38,3 +46,26 @@ jobs:
           label: Coverage
           message: ${{ env.COVERAGE }}
           color: ${{ env.COVERAGE_COLOR }}
+
+  corpus:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        profile: [raw, windows-sysmon, windows-audit, linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: SigmaHQ/sigma
+          ref: 2e8fd89f82d9104c1b30321a307254ddeea17de2
+          path: .corpus
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: pip install . pysigma-pipeline-sysmon==2.0.0 pysigma-pipeline-windows==2.0.0
+      - run: python tools/audit_corpus.py .corpus --profile ${{ matrix.profile }} --output corpus-${{ matrix.profile }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corpus-${{ matrix.profile }}
+          path: corpus-${{ matrix.profile }}.json
