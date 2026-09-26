@@ -20,7 +20,7 @@ This backend is currently maintained by:
 ## Requirements
 
 * Python 3.10 or later
-* [pySigma](https://github.com/SigmaHQ/pySigma) `>= 1.0.2, < 2.0` (tested with 1.5.0)
+* [pySigma](https://github.com/SigmaHQ/pySigma) `>= 1.5.1, < 2.0`
 
 ## Supported Features
 
@@ -74,71 +74,118 @@ SELECT * FROM logs WHERE (Flag='true' OR Flag=1)
 
 SQLite parses `a OR b OR c` into a left-deep tree whose height is the operand count, and rejects anything over `SQLITE_MAX_EXPR_DEPTH` (1000 by default) with *"Expression tree is too large"*. Chains longer than `max_flat_operands` (100) are re-associated into nested groups, which is the same boolean value at a bounded height. SigmaHQ's *Vulnerable Driver Load*, with 4431 boolean operators, is rejected at prepare time without this and parses with it.
 
-### Correlation Rules
+### Correlation rules (version 2)
 
-The backend supports Sigma correlation rules with the following types:
+Correlation output is an **alert summary**, with an occurrence time and evidence,
+not an arbitrary event or a list of group keys. The following eight types run on
+SQLite: `event_count`, `value_count`, `value_sum`, `value_avg`, `value_median`,
+`value_percentile`, `temporal`, and `temporal_ordered`. The last two also accept
+pySigma's extended Boolean conditions; `temporal_extended` and
+`temporal_ordered_extended` are internal conversion methods, not YAML types.
 
-| Correlation Type | Description |
-|-----------------|-------------|
-| `event_count` | Count events matching conditions |
-| `value_count` | Count distinct field values |
-| `temporal` | Events from multiple rules occurring within a timespan |
-| `temporal_ordered` | Events occurring in a specific order within a timespan |
-| `value_sum` | Sum of field values |
-| `value_avg` | Average of field values |
-| `value_percentile` | Percentile of field values |
-| `value_median` | Median of field values |
-| `temporal_extended` | Boolean expression over rule references within a timespan |
-| `temporal_ordered_extended` | The same, with the declared rule order enforced |
+- Counts and statistics use backward, inclusive `[t - timespan, t]` windows at
+  distinct matching event times. Separate qualifying times remain separate alerts.
+- Ordered stages must have **strictly increasing timestamps**. The compiler finds
+  a valid sequence even if earlier, out-of-order occurrences are present. Ties
+  cannot establish order. Extended OR branches are evaluated independently and
+  their evidence is merged when they describe the same window.
+- A condition containing absence, such as `a and not b`, opens a forward window
+  from a positive event and fires at its deadline. `observation_end` is Unix
+  seconds; by default the horizon is the latest valid timestamp in the input
+  tables, including events that match no detection. Unexpired windows are
+  reported as `incomplete_window`, not successful absence alerts. Pure-negative
+  conditions use observed events as context; an empty input invents no groups.
+- String grouping keys are normalized to lowercase using SQLite's ASCII folding;
+  original values remain in evidence. Value counts use NOCASE comparisons.
+- Aliases are applied to individual reference projections. Chained correlations
+  consume child alert occurrences, preserve child metrics and evidence, and
+  honour `generate`. Parent fields outside a child's grouping keys are projected
+  from its contributing events; a child counts once per parent group.
+- An event matching several rules or condition branches counts once in an
+  `event_count`. Temporal membership is retained separately.
+- Invalid timestamps and missing grouping keys are excluded consistently and
+  counted by the execution plan's diagnostics. Ordinary rules can still match
+  such events. Numeric statistics ignore NULL, invalid and nonfinite values.
+  Numeric text must be a valid JSON number (for example `12`, `-2.5`, `1e3`).
+- Percentiles use linear interpolation at rank `(n - 1) * p / 100`. Percentile 50
+  equals the median, including even sample sizes. Sums use SQLite REAL arithmetic
+  to avoid integer accumulator overflow; large integers can lose precision.
 
-Correlation rules support `group-by` for grouping results and `timespan` for temporal constraints.
-
-#### The timespan is a sliding window
-
-Sigma counts events *within the given timespan*. Aggregating over the whole search counts them over all time instead, which fires on a burst that never happened — twelve events an hour apart would satisfy "ten in five minutes". Every correlation query anchors on each matching event and looks forward over exactly one timespan:
-
-```sql
-WITH sigma_matched AS (SELECT * FROM logs WHERE EventID=1234)
-SELECT DISTINCT SourceIP FROM (
-  SELECT SourceIP, COUNT(*) OVER (
-    PARTITION BY SourceIP
-    ORDER BY CAST(strftime('%s', timestamp) AS INTEGER)
-    RANGE BETWEEN CURRENT ROW AND 300 FOLLOWING) AS event_count
-  FROM sigma_matched) AS sigma_correlated
-WHERE event_count >= 10
-```
-
-Anchoring on the last event and looking back selects the same groups whenever the condition only grows with more events — every count, sum and average — but the two differ under a negation, and looking forward is the reading that answers it.
-
-`event_count`, `value_sum` and `value_avg` use a window function. The others cannot: SQLite rejects `DISTINCT` inside a window function and does not allow a correlated subquery in `LIMIT`/`OFFSET`, so `value_count`, `value_percentile`, `value_median` and the temporal types use a scalar subquery correlated to each anchor row. That is exact, but quadratic in the number of matched events — a narrow base rule matters more for those types.
-
-#### SQLite requirements for correlation
-
-| Requirement | Description |
-|-------------|-------------|
-| **Timestamp field** | Required by every correlation type, since the timespan is applied to it. Must be a format SQLite's `strftime()` parses: ISO-8601 with or without `T`, `Z`, a fractional part or an offset. A column holding a bare epoch integer does **not** parse — `strftime('%s', 1553039077)` is `NULL`, not a time — so set `timestamp_seconds_expression` for one. |
-| **Window functions** | SQLite 3.28 or later (`RANGE` frames). |
-
-**Configurable parameters:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `table` | `<TABLE_NAME>` | Table queried by non-correlation rules; can also be set by a `setState` transformation on the `table` key |
-| `timestamp_field` | `timestamp` | Field name containing the event timestamp |
-| `timestamp_seconds_expression` | `CAST(strftime('%s', {field}) AS INTEGER)` | How that field becomes seconds. Use `CAST({field} AS INTEGER)` for an epoch column |
-| `collate_nocase` | `False` | Emit `COLLATE NOCASE` on literal string equality |
-| `max_flat_operands` | `100` | Longest flat `AND`/`OR` chain before operands are regrouped |
+SQLite **3.38.0 or newer, including its JSON functions**, is required for
+correlations. No custom SQL function is required by the correlation engine.
+The default ISO timestamp expression retains millisecond precision, the precision
+of SQLite's date parser. Provide a numeric seconds expression to retain finer
+precision. Plain detection SQL still only needs the features it uses; REGEXP
+continues to require a registered function.
 
 ```python
-backend = sqliteBackend(correlation_methods=["default"])
-backend.timestamp_field = "event_time"
+backend = sqliteBackend(
+    table="logs",
+    timestamp_field="SystemTime",
+    event_id_field="row_id",             # default: SQLite rowid
+    observation_end=1704067500,           # optional explicit observation horizon
+)
+# For epoch seconds (including fractional seconds):
+backend = sqliteBackend(timestamp_field="event_time", timestamp_format="unix")
 ```
 
-**Notes:**
-- For multi-rule correlations, the backend adds a `sigma_rule_id` column identifying which rule matched each event
-- Timespan values are converted to seconds internally
-- `temporal_ordered` enforces the declared order: the first occurrence of each referenced rule inside the window must not be later than the first occurrence of the next one
-- Correlation queries are emitted as a CTE (`WITH ...`). Zircolite reads Channel/EventID bounds only off statement shapes it can prove, so a correlation rule leaves those bounds open — which is what it already does for any correlation rule, and is its documented fail-open
+Documented settings are constructor keywords. Existing instance-attribute
+configuration remains supported; `timestamp_format` selects its expression at construction. `table` defaults to `logs` for both output formats; pipeline `setState`
+values take precedence. Other settings are `timestamp_field` (default `timestamp`),
+`timestamp_seconds_expression`, `event_id_field` (default `rowid`),
+`timestamp_format` (`iso`, `unix`, `unix_ms`, `unix_us`),
+`observation_end`, `collate_nocase` (default `False`), and `max_flat_operands`
+(default `100`). Event identifiers must be non-NULL and unique within a table.
+
+#### Result and execution contracts
+
+The standalone SQL returns these columns:
+
+| Column | Meaning |
+|---|---|
+| `alert_id` | Deterministic occurrence identifier within the input snapshot |
+| `group_keys` | JSON object of grouping keys; `{}` for ungrouped correlations |
+| `occurrence_time`, `window_start`, `window_end` | Unix seconds, including fractional seconds |
+| `metric_name`, `metric_value` | Correlation type and aggregate value |
+| `event_count` | Number of contributing physical events, separate from the metric |
+| `event_ids` | JSON array of table-scoped source event identifiers |
+| `child_alert_ids` | JSON array of child occurrence identifiers |
+
+IDs refer to the current input snapshot, not a global event store. A pure-negative
+alert's evidence records the observed context that started its timer.
+
+The `zircolite` format retains the `rule` list of standalone SELECT statements
+and adds `schema_version: 2`, `result_type`, and compiler-derived `required_fields`.
+Ordinary rules also carry `source_table` and `logsource`. Correlations carry a
+`correlation_plan` with version, ordered SELECT preparation stages and indexes,
+result SQL, diagnostic SQL, source-table identities, and cleanup names.
+
+```python
+import json
+from sigma.backends.sqlite.runtime import execute_plan
+
+entry = json.loads(backend.convert(collection, "zircolite"))[-1]
+alerts, diagnostics = execute_plan(connection, entry["correlation_plan"])
+# alerts contain parsed group_keys/event_ids and full source event evidence.
+```
+
+`execute_plan` widens missing event fields from compiler metadata, materializes
+indexed temporary relations, retrieves results and evidence, then removes the
+temporary relations. Widening is a schema change to the source table itself:
+`execute_plan` (like `ensure_fields`) adds each absent field as a NULL
+`TEXT COLLATE NOCASE` column. It never commits the caller's transaction. Callers own
+connection-level cancellation and transaction recovery after SQLite interrupts.
+Set `include_events=False` to omit expanded source records, and `limit=N` to
+retrieve at most `N + 1` summaries, earliest occurrences first, for a
+discard-noisy-rule policy.
+
+The CTE and indexed paths compile from the same relations. The indexed path avoids
+full scans for each bounded lookup. Dense windows can nevertheless have quadratic
+**evidence volume**, and medians/percentiles sort each qualifying sample. Use
+selective base rules, result limits and measured runtime budgets; see
+`tools/benchmark_correlations.py`.
+
+See [the migration guide](docs/migration-v2.md).
 
 ### Other Features
 
@@ -146,7 +193,7 @@ backend.timestamp_field = "event_time"
 * **Boolean values**: matched against both text and numeric storage (see *Booleans* above)
 * **Field name quoting**: Special characters in field names are quoted with backticks
 * **Wildcard escaping**: Proper escaping of `%` and `_` characters in values, including values read from a second field by `|fieldref`
-* **Table name**: `<TABLE_NAME>` by default and `logs` for the `zircolite` format; both honour a `setState` transformation on the `table` key
+* **Table name**: `logs` for both output formats; both honour a `setState` transformation on the `table` key
 
 ## Known issues/limitations
 
@@ -155,11 +202,11 @@ backend.timestamp_field = "event_time"
 * `|cidr` is expanded into `LIKE` prefixes, since SQLite has no network type. For IPv6 this only matches addresses written in the same canonical form as the expansion
 * The backend cannot know the target schema, so a rule naming a column the database does not have fails to prepare, taking its other branches with it. Zircolite widens its table with the missing columns as `NULL`; another consumer has to do the same
 
-# Quick Start 
+# Quick Start
 
 ## Example script (default output) with sysmon pipeline
 
-### Add pipelines 
+### Add pipelines
 
 ```shell
 poetry add pysigma-pipeline-sysmon

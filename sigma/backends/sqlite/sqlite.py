@@ -19,17 +19,24 @@ from sigma.types import (
     SigmaString,
     SpecialChars,
     SigmaCIDRExpression,
+    SigmaFieldReference,
     TimestampPart,
 )
 from sigma.correlations import (
     SigmaCorrelationConditionOperator,
     SigmaCorrelationRule,
-    SigmaCorrelationTypeLiteral,
 )
+
+from .correlation import CorrelationCompiler, numeric, quote
 
 import re
 import json
 from typing import ClassVar, Dict, List, Optional, Pattern, Tuple, Union, Any
+
+
+_SQLITE_KEYWORDS = set(
+    "ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE AND AS ASC ATTACH AUTOINCREMENT BEFORE BEGIN BETWEEN BY CASCADE CASE CAST CHECK COLLATE COLUMN COMMIT CONFLICT CONSTRAINT CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFAULT DEFERRABLE DEFERRED DELETE DESC DETACH DISTINCT DO DROP EACH ELSE END ESCAPE EXCEPT EXCLUDE EXCLUSIVE EXISTS EXPLAIN FAIL FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GENERATED GLOB GROUP GROUPS HAVING IF IGNORE IMMEDIATE IN INDEX INDEXED INITIALLY INNER INSERT INSTEAD INTERSECT INTO IS ISNULL JOIN KEY LAST LEFT LIKE LIMIT MATCH MATERIALIZED NATURAL NO NOT NOTHING NOTNULL NULL NULLS OF OFFSET ON OR ORDER OTHERS OUTER OVER PARTITION PLAN PRAGMA PRECEDING PRIMARY QUERY RAISE RANGE RECURSIVE REFERENCES REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SAVEPOINT SELECT SET TABLE TEMP TEMPORARY THEN TIES TO TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE UPDATE USING VACUUM VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHOUT".split()
+)
 
 
 class sqliteBackend(TextQueryBackend):
@@ -281,269 +288,16 @@ class sqliteBackend(TextQueryBackend):
         ""  # String used as query if final query only contains deferred expression
     )
 
-    # ========== Correlation Rule Templates ==========
-    #
-    # Sigma counts events "within the given timespan". Aggregating over the whole search counts
-    # them over all time instead, which fires on a burst that never happened -- twelve events an
-    # hour apart satisfied "ten in five minutes". Every query below anchors on each matching
-    # event and reads exactly one timespan forward from it, which is the window Sigma
-    # describes; see correlation_window_expression for why forward rather than back.
-    #
-    # Two frames cover every correlation type. The search is a CTE in both, so it is written
-    # once however many times the aggregate reads it:
-    #
-    #  * window frame -- the aggregate is a window function over a RANGE frame. Cheap, but
-    #    SQLite rejects DISTINCT inside a window function, so only COUNT(*), SUM and AVG can be
-    #    expressed this way.
-    #  * correlated frame -- the aggregate is a scalar subquery correlated to the anchor row.
-    #    This carries COUNT(DISTINCT ...) and the rank-based statistics, at the cost of being
-    #    quadratic in the number of matched events.
-    #
-    # A window function cannot be referenced from the WHERE of the SELECT computing it, and
-    # neither can a correlated subquery appear in LIMIT or OFFSET, so both frames compute the
-    # aggregate in a subquery and test it outside.
-
-    # Identifiers the frames introduce. They are prefixed so they cannot collide with an event
-    # field of the same name.
-    correlation_cte: ClassVar[str] = "sigma_matched"
-    correlation_anchor_alias: ClassVar[str] = "sigma_anchor"
-    correlation_window_alias: ClassVar[str] = "sigma_window"
-    correlation_ranked_alias: ClassVar[str] = "sigma_ranked"
-    correlation_wrapper_alias: ClassVar[str] = "sigma_correlated"
-
-    # The correlation search templates cannot take a table name from pySigma, so they carry a
-    # sentinel that is substituted afterwards. NUL cannot occur in SQL text, which a literal
-    # "FROM logs" could -- inside a rule's own string value.
-    correlation_table_placeholder: ClassVar[str] = "\x00table\x00"
-    correlation_table: ClassVar[str] = "logs"
-
-    # Correlation search expressions
-    # For single rule, build a SELECT query with the condition
-    correlation_search_single_rule_expression: ClassVar[Optional[str]] = (
-        "SELECT * FROM "
-        + correlation_table_placeholder
-        + " WHERE {query}{normalization}"
+    # Correlations are compiled as relations, never nested finalized SQL strings.
+    table = "logs"
+    timestamp_field = "timestamp"
+    event_id_field = "rowid"
+    timestamp_format = "iso"
+    observation_end = None
+    timestamp_seconds_expression = (
+        "ROUND((julianday({field}) - 2440587.5) * 86400000) / 1000.0"
     )
-    correlation_search_multi_rule_expression: ClassVar[Optional[str]] = "{queries}"
-    correlation_search_multi_rule_query_expression: ClassVar[Optional[str]] = (
-        "SELECT *, '{ruleid}' AS sigma_rule_id FROM "
-        + correlation_table_placeholder
-        + " WHERE {query}{normalization}"
-    )
-    correlation_search_multi_rule_query_expression_joiner: ClassVar[Optional[str]] = (
-        " UNION ALL "
-    )
-
-    # Field normalization for aliases
-    correlation_search_field_normalization_expression: ClassVar[Optional[str]] = (
-        "{field} AS {alias}"
-    )
-    correlation_search_field_normalization_expression_joiner: ClassVar[
-        Optional[str]
-    ] = ", "
-
-    # Timespan is converted to seconds for SQLite
-    timespan_seconds: ClassVar[bool] = True
-
-    # How an event timestamp becomes the number of seconds the window arithmetic needs.
-    # strftime parses ISO-8601 with or without "T", "Z", a fractional part or an offset, which
-    # is what a flattener produces. A column holding a bare epoch integer needs
-    # "CAST({field} AS INTEGER)" instead -- strftime('%s', 1553039077) is NULL, not a time.
-    timestamp_seconds_expression: ClassVar[str] = (
-        "CAST(strftime('%s', {field}) AS INTEGER)"
-    )
-
-    # ---- frames ----------------------------------------------------------------
-    correlation_window_frame: ClassVar[str] = (
-        "WITH {cte} AS ({search})"
-        " SELECT DISTINCT {select_fields}"
-        " FROM (SELECT {select_fields}{aggregate} FROM {cte}) AS {wrapper}"
-        " WHERE {condition}"
-    )
-    correlation_correlated_frame: ClassVar[str] = (
-        "WITH {cte} AS ({search})"
-        " SELECT DISTINCT {select_fields}"
-        " FROM (SELECT {anchor_fields}{aggregate} FROM {cte} AS {anchor}) AS {wrapper}"
-        " WHERE {condition}"
-    )
-
-    # ---- window and correlation clauses ----------------------------------------
-    #
-    # The window runs forward from the anchor event: a correlation is read as "this event
-    # happened, and within the timespan that follows ...".
-    #
-    # Anchoring on the last event instead and looking back picks out exactly the same groups
-    # whenever the condition only grows as more events enter the window -- event_count,
-    # value_count, the temporal rule counts, and value_sum over non-negative values -- because
-    # shifting any window until an event sits on its edge never drops an event out of it.
-    # value_avg, value_median and value_percentile are not monotone in that way, and the two
-    # anchorings can disagree for them: with values 0 at t and 100 at t+3, a five-second window
-    # averages 100 forward and 50 backward. Negation is the other place they differ, and it is
-    # the one that decides the choice -- "rule_a and not rule_b" is false for an event followed
-    # by rule_b, rather than true for every first event of a pair.
-    correlation_window_expression: ClassVar[str] = (
-        "{partition}ORDER BY {timestamp} RANGE BETWEEN CURRENT ROW AND {timespan} FOLLOWING"
-    )
-    correlation_partition_expression: ClassVar[str] = "PARTITION BY {fields} "
-    correlation_correlate_expression: ClassVar[str] = (
-        "{group}{inner_timestamp} BETWEEN {anchor_timestamp}"
-        " AND {anchor_timestamp} + {timespan}"
-    )
-    correlation_correlate_group_expression: ClassVar[str] = (
-        "{inner}.{field} = {anchor}.{field} AND "
-    )
-
-    # Rank of each value inside one anchor's window, and the size of that window. SQLite has no
-    # percentile aggregate, and the LIMIT/OFFSET form cannot be correlated, so the position is
-    # computed explicitly and selected with a comparison.
-    correlation_ranking_expression: ClassVar[str] = (
-        "SELECT {inner}.{field} AS {field},"
-        " ROW_NUMBER() OVER (ORDER BY {inner}.{field}) AS sigma_rank,"
-        " COUNT(*) OVER () AS sigma_rank_total"
-        " FROM {cte} AS {inner} WHERE {correlate}"
-    )
-
-    # Ordering test for the temporal_ordered types: the first occurrence of each referenced
-    # rule inside the window must not be later than the first occurrence of the next one.
-    # Without it the query only counts the rules and is indistinguishable from plain temporal.
-    correlation_order_expression: ClassVar[str] = (
-        "SELECT COALESCE({comparisons}, 0) FROM {cte} AS {inner} WHERE {correlate}"
-    )
-    correlation_order_rule_time_expression: ClassVar[str] = (
-        "MIN(CASE WHEN {inner}.sigma_rule_id = '{ruleid}' THEN {inner_timestamp} END)"
-    )
-    correlation_order_comparison_joiner: ClassVar[str] = " AND "
-
-    # ---- per-type queries ------------------------------------------------------
-    event_count_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_window_frame,
-    }
-    event_count_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", COUNT(*) OVER ({window}) AS event_count",
-    }
-    event_count_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "event_count {op} {count}",
-    }
-
-    value_count_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    value_count_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", (SELECT COUNT(DISTINCT {inner}.{field}) FROM {cte} AS {inner}"
-        " WHERE {correlate}) AS value_count",
-    }
-    value_count_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "value_count {op} {count}",
-    }
-
-    value_sum_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_window_frame,
-    }
-    value_sum_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", SUM({field}) OVER ({window}) AS value_sum",
-    }
-    value_sum_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "value_sum {op} {count}",
-    }
-
-    value_avg_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_window_frame,
-    }
-    value_avg_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", AVG({field}) OVER ({window}) AS value_avg",
-    }
-    value_avg_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "value_avg {op} {count}",
-    }
-
-    value_percentile_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    value_percentile_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", (SELECT MIN({ranked}.{field}) FROM ({ranking}) AS {ranked}"
-        " WHERE {ranked}.sigma_rank * 100 >= {ranked}.sigma_rank_total * {percentile})"
-        " AS value_percentile",
-    }
-    value_percentile_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "value_percentile {op} {count}",
-    }
-
-    value_median_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    value_median_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", (SELECT AVG({ranked}.{field}) FROM ({ranking}) AS {ranked}"
-        " WHERE {ranked}.sigma_rank IN (({ranked}.sigma_rank_total + 1) / 2,"
-        " ({ranked}.sigma_rank_total + 2) / 2)) AS value_median",
-    }
-    value_median_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "value_median {op} {count}",
-    }
-
-    temporal_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    temporal_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", (SELECT COUNT(DISTINCT {inner}.sigma_rule_id) FROM {cte} AS {inner}"
-        " WHERE {correlate}) AS rule_count",
-    }
-    temporal_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "rule_count {op} {count}",
-    }
-
-    temporal_ordered_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    temporal_ordered_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", (SELECT COUNT(DISTINCT {inner}.sigma_rule_id) FROM {cte} AS {inner}"
-        " WHERE {correlate}) AS rule_count, ({ordering}) AS rule_order",
-    }
-    temporal_ordered_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "rule_count {op} {count} AND rule_order",
-    }
-
-    # Extended temporal conditions are boolean expressions over rule references. The rules seen
-    # inside the window are collected into one delimited string so a reference becomes a
-    # substring test, which is all pySigma's rule reference template can express -- it is given
-    # the rule id and nothing else. instr is used rather than LIKE because a rule name may
-    # contain "_", which LIKE would read as a wildcard.
-    temporal_extended_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    temporal_extended_aggregation_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", COALESCE((SELECT ',' || GROUP_CONCAT(DISTINCT {inner}.sigma_rule_id) || ','"
-        " FROM {cte} AS {inner} WHERE {correlate}), ',') AS sigma_window_rules",
-    }
-    temporal_extended_condition_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "{extended_condition}",
-    }
-
-    temporal_ordered_extended_correlation_query: ClassVar[Optional[Dict[str, str]]] = {
-        "default": correlation_correlated_frame,
-    }
-    temporal_ordered_extended_aggregation_expression: ClassVar[
-        Optional[Dict[str, str]]
-    ] = {
-        "default": ", COALESCE((SELECT ',' || GROUP_CONCAT(DISTINCT {inner}.sigma_rule_id) || ','"
-        " FROM {cte} AS {inner} WHERE {correlate}), ',') AS sigma_window_rules,"
-        " ({ordering}) AS rule_order",
-    }
-    temporal_ordered_extended_condition_expression: ClassVar[
-        Optional[Dict[str, str]]
-    ] = {
-        "default": "{extended_condition} AND rule_order",
-    }
-
-    extended_correlation_condition_rule_reference_expression: ClassVar[
-        Optional[Dict[str, str]]
-    ] = {
-        "default": "instr(sigma_window_rules, ',{ruleid},') > 0",
-    }
-
-    # Correlation condition operator mapping
-    correlation_condition_mapping: ClassVar[
-        Optional[Dict[SigmaCorrelationConditionOperator, str]]
-    ] = {
+    correlation_condition_mapping = {
         SigmaCorrelationConditionOperator.LT: "<",
         SigmaCorrelationConditionOperator.LTE: "<=",
         SigmaCorrelationConditionOperator.GT: ">",
@@ -552,192 +306,129 @@ class sqliteBackend(TextQueryBackend):
         SigmaCorrelationConditionOperator.NEQ: "!=",
     }
 
-    # Referenced rules expressions
-    referenced_rules_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "'{ruleid}'",
-    }
-    referenced_rules_expression_joiner: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", ",
-    }
+    def __init__(self, processing_pipeline=None, collect_errors=False, **options):
+        configurable = {
+            "table",
+            "timestamp_field",
+            "event_id_field",
+            "observation_end",
+            "timestamp_seconds_expression",
+            "timestamp_format",
+            "collate_nocase",
+            "max_flat_operands",
+        }
+        for key in configurable & options.keys():
+            value = options[key]
+            if key == "collate_nocase" and isinstance(value, str):
+                if value.lower() not in ("true", "false"):
+                    raise ValueError("collate_nocase must be true or false")
+                value = value.lower() == "true"
+            if key == "max_flat_operands":
+                value = int(value)
+                if value < 2:
+                    raise ValueError("max_flat_operands must be at least 2")
+            setattr(self, key, value)
+        if self.timestamp_format not in ("iso", "unix", "unix_ms", "unix_us"):
+            raise ValueError("timestamp_format must be iso, unix, unix_ms or unix_us")
+        if (
+            self.timestamp_format != "iso"
+            and "timestamp_seconds_expression" not in options
+        ):
+            divisor = {"unix": 1, "unix_ms": 1000, "unix_us": 1000000}[
+                self.timestamp_format
+            ]
+            self.timestamp_seconds_expression = f"({numeric('{field}')}) / {divisor}.0"
+        self._correlation_plans = {}
+        super().__init__(processing_pipeline, collect_errors, **options)
 
-    # Group by expressions are unused by the frames above -- the timespan is part of the
-    # aggregate rather than of a GROUP BY -- but pySigma requires them to be defined.
-    groupby_expression: ClassVar[Optional[Dict[str, str]]] = {"default": ""}
-    groupby_field_expression: ClassVar[Optional[Dict[str, str]]] = {
-        "default": "{field}"
-    }
-    groupby_field_expression_joiner: ClassVar[Optional[Dict[str, str]]] = {
-        "default": ", "
-    }
-    groupby_expression_nofield: ClassVar[Optional[Dict[str, str]]] = {"default": ""}
+    def convert_condition_field_eq_field(self, cond, state):
+        expression = super().convert_condition_field_eq_field(cond, state)
+        if (
+            self.collate_nocase
+            and isinstance(expression, str)
+            and " LIKE " not in expression
+        ):
+            return self.collation_expression.format(expr=expression)
+        return expression
 
-    table = "<TABLE_NAME>"
-    timestamp_field = "timestamp"  # Default timestamp field name for correlations
+    def init_processing_pipeline(self, output_format=None):
+        self._output_format = output_format or self.default_format
+        super().init_processing_pipeline(output_format)
 
-    def _correlation_timestamp(self, alias: Optional[str] = None) -> str:
-        """The event timestamp as seconds, optionally qualified by a table alias."""
+    def resolve_table(self, state=None):
+        table = (state or {}).get("table") or self.table
+        # Keep simple names readable, quote every component of a qualified name.
+        return ".".join(self.escape_and_quote_field(part) for part in table.split("."))
+
+    def escape_and_quote_field(self, field):
+        # SQLite keywords are identifiers only when quoted. This set includes
+        # all keywords in SQLite 3.38+, including window-function vocabulary.
+        if (
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field)
+            and field.upper() not in _SQLITE_KEYWORDS
+        ):
+            return field
+        return quote(field)
+
+    def _correlation_timestamp(self, alias=None):
         field = self.escape_and_quote_field(self.timestamp_field)
-        if alias is not None:
+        if alias:
             field = f"{alias}.{field}"
         return self.timestamp_seconds_expression.format(field=field)
 
-    def _correlation_order_comparisons(
-        self, rule: SigmaCorrelationRule, inner: str
-    ) -> str:
-        """The temporal_ordered test: each rule's first event no later than the next rule's."""
-        times = [
-            self.correlation_order_rule_time_expression.format(
-                inner=inner,
-                ruleid=reference.rule.name or reference.rule.id,
-                inner_timestamp=self._correlation_timestamp(inner),
-            )
-            for reference in rule.referenced_rules
-        ]
-        if len(times) < 2:  # a single rule is trivially in order
-            return "1"
-        return self.correlation_order_comparison_joiner.join(
-            f"{earlier} <= {later}" for earlier, later in zip(times, times[1:])
+    def required_fields(self, rule):
+        fields = set()
+
+        def walk(cond):
+            if isinstance(cond, ConditionFieldEqualsValueExpression):
+                if cond.field:
+                    fields.add(cond.field)
+                if isinstance(cond.value, SigmaFieldReference):
+                    fields.add(cond.value.field)
+            for arg in getattr(cond, "args", []):
+                walk(arg)
+
+        for condition in rule.detection.parsed_condition:
+            walk(condition.parsed)
+        return sorted(fields)
+
+    def convert_correlation_rule(
+        self, rule, output_format=None, method=None, callback=None
+    ):
+        if not hasattr(self, "last_processing_pipeline"):
+            self.init_processing_pipeline(output_format)
+        queries = super().convert_correlation_rule(
+            rule, output_format, method, callback
         )
+        return queries if rule._output else []
 
-    def convert_correlation_rule_from_template(
-        self,
-        rule: SigmaCorrelationRule,
-        correlation_type: SigmaCorrelationTypeLiteral,
-        method: str,
-    ) -> List[str]:
-        """Build the correlation query from this backend's frames.
-
-        pySigma's own implementation formats the query template with a fixed set of
-        placeholders. The frames here need a few more -- the CTE and alias names, the window
-        clause, the correlation predicate -- so the aggregation and the query are formatted
-        from one parameter set instead.
-        """
-        from sigma.correlations import SigmaCorrelationCondition
-        from sigma.exceptions import SigmaConversionError
-
-        template = (
-            getattr(self, f"{correlation_type}_correlation_query")
-            or self.default_correlation_query
-        )
-        if template is None:
-            raise NotImplementedError(
-                f"Correlation rule type '{correlation_type}' is not supported by backend."
-            )
-        if method not in template:
-            raise SigmaConversionError(
-                rule,
-                rule.source,
-                f"Correlation method '{method}' is not supported by backend for correlation type '{correlation_type}'.",
-            )
-
-        aggregation_templates = getattr(
-            self, f"{correlation_type}_aggregation_expression"
-        )
-        if aggregation_templates is None:
-            raise NotImplementedError(
-                f"Correlation type '{correlation_type}' is not supported by backend."
-            )
-        condition = rule.condition
+    def convert_rule(self, rule, output_format=None, callback=None):
+        queries = super().convert_rule(rule, output_format, callback)
+        # pySigma stores predicates for referenced rules. generate:true must
+        # still emit finalized standalone queries without overwriting them.
         if (
-            correlation_type == "value_percentile"
-            and isinstance(condition, SigmaCorrelationCondition)
-            and condition.percentile is None
+            rule._backreferences
+            and rule._output
+            and not self.finalize_correlation_subqueries
         ):
-            raise SigmaConversionError(
-                rule,
-                rule.source,
-                "Percentile must be specified in condition for value_percentile correlation type",
-            )
-
-        # The search templates carry a sentinel rather than a table name; a setState
-        # transformation may replace it, exactly as finalize_query_default allows.
-        table = (
-            self.last_processing_pipeline.state.get("table") or self.correlation_table
-        )
-        search = self.convert_correlation_search(rule).replace(
-            self.correlation_table_placeholder, table
-        )
-
-        cte = self.correlation_cte
-        anchor = self.correlation_anchor_alias
-        inner = self.correlation_window_alias
-        group_by = [self.escape_and_quote_field(field) for field in rule.group_by or []]
-        timespan = self.convert_timespan(rule.timespan, method)
-
-        params: Dict[str, Any] = {
-            "cte": cte,
-            "anchor": anchor,
-            "inner": inner,
-            "ranked": self.correlation_ranked_alias,
-            "wrapper": self.correlation_wrapper_alias,
-            "search": search,
-            "timespan": timespan,
-            "timestamp": self._correlation_timestamp(),
-            "typing": self.convert_correlation_typing(rule),
-            "rule": rule,
-            "referenced_rules": self.convert_referenced_rules(
-                rule.referenced_rules, method
-            ),
-            "fields": self.convert_correlation_aggregation_fields_from_template(
-                rule.fields, rule.referenced_rules, rule.group_by, method
-            ),
-            "groupby": self.convert_correlation_aggregation_groupby_from_template(
-                rule.group_by, method
-            ),
-            "field": (
-                self.escape_and_quote_field(condition.fieldref)
-                if isinstance(condition, SigmaCorrelationCondition)
-                and condition.fieldref
-                else ""
-            ),
-            "percentile": (
-                condition.percentile
-                if isinstance(condition, SigmaCorrelationCondition)
-                and condition.percentile is not None
-                else ""
-            ),
-            # Without group-by every matching event belongs to the same series, so the whole
-            # row is carried through; with it only the grouped fields are, which is also what
-            # makes the result one row per offending group.
-            "select_fields": ", ".join(group_by) if group_by else "*",
-            "anchor_fields": (
-                ", ".join(f"{anchor}.{field}" for field in group_by)
-                if group_by
-                else f"{anchor}.*"
-            ),
-            "partition": (
-                self.correlation_partition_expression.format(fields=", ".join(group_by))
-                if group_by
-                else ""
-            ),
-        }
-        params["correlate"] = self.correlation_correlate_expression.format(
-            group="".join(
-                self.correlation_correlate_group_expression.format(
-                    inner=inner, anchor=anchor, field=field
+            return [
+                self.finalize_query(
+                    rule,
+                    query,
+                    i,
+                    rule.get_conversion_states()[i],
+                    output_format or self.default_format,
                 )
-                for field in group_by
-            ),
-            inner_timestamp=self._correlation_timestamp(inner),
-            anchor_timestamp=self._correlation_timestamp(anchor),
-            timespan=timespan,
-        )
-        params["window"] = self.correlation_window_expression.format(**params)
-        # Built only where used: the ranking reads the condition's fieldref and the ordering
-        # reads sigma_rule_id, neither of which a type that does not ask for them has.
-        aggregation_template = aggregation_templates[method]
-        if "{ranking}" in aggregation_template:
-            params["ranking"] = self.correlation_ranking_expression.format(**params)
-        if "{ordering}" in aggregation_template:
-            params["ordering"] = self.correlation_order_expression.format(
-                comparisons=self._correlation_order_comparisons(rule, inner), **params
-            )
-        params["aggregate"] = aggregation_template.format(**params)
-        params["condition"] = self.convert_correlation_condition_from_template(
-            condition, rule.referenced_rules, correlation_type, method
-        )
+                for i, query in enumerate(queries)
+            ]
+        return queries
 
-        return [template[method].format(**params)]
+    def convert_correlation_rule_from_template(self, rule, correlation_type, method):
+        if method != "default":
+            raise ValueError(f"Unknown correlation method: {method}")
+        query, plan = CorrelationCompiler(self, rule).compile()
+        self._correlation_plans[id(rule)] = plan
+        return [query]
 
     def _join_operands(self, args: List[str], joiner: str) -> str:
         """Join boolean operands, regrouping long chains to stay under SQLite's depth limit.
@@ -1098,7 +789,7 @@ class sqliteBackend(TextQueryBackend):
 
         # Table name can be overridden per-pipeline via a setState transformation
         # setting the "table" state key, else fall back to the backend default.
-        table = state.processing_state.get("table", self.table)
+        table = self.resolve_table(state.processing_state)
         sqlite_query = f"SELECT * FROM {table} WHERE {query}"
 
         return sqlite_query
@@ -1185,7 +876,7 @@ class sqliteBackend(TextQueryBackend):
         else:
             # Zircolite's table is always named "logs"; a setState transformation may still
             # override it, exactly as finalize_query_default allows.
-            table = state.processing_state.get("table", "logs")
+            table = self.resolve_table(state.processing_state)
             sqlite_query = f"SELECT * FROM {table} WHERE {query}"
             # Channels and event IDs the rule's condition provably requires
             channels = self._extract_field_values_from_rule(rule, "Channel", index)
@@ -1212,6 +903,22 @@ class sqliteBackend(TextQueryBackend):
             # Zircolite's own converter sets this; it is what keeps a correlation rule out of
             # the Channel/EventID pre-filter, whose subquery shape it deliberately does not read.
             zircolite_rule["correlation"] = True
+            plan = self._correlation_plans[id(rule)]
+            zircolite_rule["correlation_plan"] = plan
+            zircolite_rule["required_fields"] = sorted(
+                set().union(*map(set, plan["required_fields"].values()))
+            )
+            zircolite_rule["result_type"] = "correlation"
+        else:
+            zircolite_rule["required_fields"] = self.required_fields(rule)
+            zircolite_rule["result_type"] = "event"
+            zircolite_rule["source_table"] = self.resolve_table(state.processing_state)
+            zircolite_rule["logsource"] = {
+                key: getattr(rule.logsource, key)
+                for key in ("product", "category", "service")
+                if getattr(rule.logsource, key, None) is not None
+            }
+        zircolite_rule["schema_version"] = 2
         return zircolite_rule
 
     def finalize_output_zircolite(self, queries: List[Dict]) -> str:

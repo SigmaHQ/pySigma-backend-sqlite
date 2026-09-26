@@ -175,3 +175,6 @@ temp.py
 type_info.json
 .pdm-build/
 src/pdm/models/VERSION
+# Local Zircolite / rules-generator integration kit (patches, helper scripts,
+# validation record). Deliberately untracked: not part of the backend package.
+/integrations/
