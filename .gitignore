@@ -178,3 +178,10 @@ src/pdm/models/VERSION
 # Local Zircolite / rules-generator integration kit (patches, helper scripts,
 # validation record). Deliberately untracked: not part of the backend package.
 /integrations/
+
+# AI coding assistant state and instructions (local, not part of the backend)
+.remember/
+.claude/
+CLAUDE.md
+.cursor/
+.ruff_cache/
