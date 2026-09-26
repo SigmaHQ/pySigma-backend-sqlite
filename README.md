@@ -171,10 +171,13 @@ alerts, diagnostics = execute_plan(connection, entry["correlation_plan"])
 
 `execute_plan` widens missing event fields from compiler metadata, materializes
 indexed temporary relations, retrieves results and evidence, then removes the
-temporary relations. It never commits the caller's transaction. Callers own
+temporary relations. Widening is a schema change to the source table itself:
+`execute_plan` (like `ensure_fields`) adds each absent field as a NULL
+`TEXT COLLATE NOCASE` column. It never commits the caller's transaction. Callers own
 connection-level cancellation and transaction recovery after SQLite interrupts.
 Set `include_events=False` to omit expanded source records, and `limit=N` to
-retrieve at most `N + 1` summaries for a discard-noisy-rule policy.
+retrieve at most `N + 1` summaries, earliest occurrences first, for a
+discard-noisy-rule policy.
 
 The CTE and indexed paths compile from the same relations. The indexed path avoids
 full scans for each bounded lookup. Dense windows can nevertheless have quadratic

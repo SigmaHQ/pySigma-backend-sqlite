@@ -81,27 +81,25 @@ def execute_plan(connection, plan, *, limit=None, include_events=True):
             event_field = quote(plan["event_id_field"])
             for table_id, ids in ids_by_table.items():
                 table = plan["source_tables"][table_id]
-                ids = sorted(ids)
-                for offset in range(0, len(ids), 400):
-                    chunk = ids[offset : offset + 400]
-                    cursor = connection.execute(
-                        f"SELECT CAST({event_field} AS TEXT), * FROM {table} "
-                        f'WHERE CAST({event_field} AS TEXT) IN ({",".join("?" for _ in chunk)})',
-                        chunk,
-                    )
-                    columns = [d[0] for d in cursor.description][1:]
-                    for event in cursor:
-                        identity = table_id + ":" + event[0]
-                        evidence[identity] = {
-                            "event_id": identity,
-                            "source_table": table,
-                            "event": {
-                                k: v
-                                for k, v in zip(columns, event[1:])
-                                if v is not None
-                            },
-                        }
-                    cursor.close()
+                # The CAST keeps IDs comparable whatever the column's type, but
+                # it also defeats any index, so fetch every ID in one scan.
+                cursor = connection.execute(
+                    f"SELECT CAST({event_field} AS TEXT), * FROM {table} "
+                    f"WHERE CAST({event_field} AS TEXT) IN "
+                    "(SELECT value FROM json_each(?))",
+                    (json.dumps(sorted(ids)),),
+                )
+                columns = [d[0] for d in cursor.description][1:]
+                for event in cursor:
+                    identity = table_id + ":" + event[0]
+                    evidence[identity] = {
+                        "event_id": identity,
+                        "source_table": table,
+                        "event": {
+                            k: v for k, v in zip(columns, event[1:]) if v is not None
+                        },
+                    }
+                cursor.close()
             for row in rows:
                 row["evidence"] = [evidence[i] for i in row["event_ids"]]
         return rows, diagnostics

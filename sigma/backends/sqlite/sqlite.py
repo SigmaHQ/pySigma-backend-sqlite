@@ -19,13 +19,15 @@ from sigma.types import (
     SigmaString,
     SpecialChars,
     SigmaCIDRExpression,
+    SigmaFieldReference,
     TimestampPart,
 )
 from sigma.correlations import (
     SigmaCorrelationConditionOperator,
     SigmaCorrelationRule,
-    SigmaCorrelationTypeLiteral,
 )
+
+from .correlation import CorrelationCompiler, numeric, quote
 
 import re
 import json
@@ -332,8 +334,6 @@ class sqliteBackend(TextQueryBackend):
             self.timestamp_format != "iso"
             and "timestamp_seconds_expression" not in options
         ):
-            from .correlation import numeric
-
             divisor = {"unix": 1, "unix_ms": 1000, "unix_us": 1000000}[
                 self.timestamp_format
             ]
@@ -361,8 +361,6 @@ class sqliteBackend(TextQueryBackend):
         return ".".join(self.escape_and_quote_field(part) for part in table.split("."))
 
     def escape_and_quote_field(self, field):
-        from .correlation import quote
-
         # SQLite keywords are identifiers only when quoted. This set includes
         # all keywords in SQLite 3.38+, including window-function vocabulary.
         if (
@@ -379,8 +377,6 @@ class sqliteBackend(TextQueryBackend):
         return self.timestamp_seconds_expression.format(field=field)
 
     def required_fields(self, rule):
-        from sigma.types import SigmaFieldReference
-
         fields = set()
 
         def walk(cond):
@@ -428,8 +424,6 @@ class sqliteBackend(TextQueryBackend):
         return queries
 
     def convert_correlation_rule_from_template(self, rule, correlation_type, method):
-        from .correlation import CorrelationCompiler
-
         if method != "default":
             raise ValueError(f"Unknown correlation method: {method}")
         query, plan = CorrelationCompiler(self, rule).compile()

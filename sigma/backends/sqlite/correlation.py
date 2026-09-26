@@ -15,7 +15,6 @@ import math
 
 from sigma.correlations import (
     CorrelationConditionAND,
-    CorrelationConditionOR,
     CorrelationConditionNOT,
     SigmaCorrelationRule,
     SigmaExtendedCorrelationCondition,
@@ -34,7 +33,8 @@ def quote(value: str) -> str:
 
 def json_object(pairs: list[tuple[str, str]]) -> str:
     # SQLite 3.38 has a 127-argument function limit. Patch small objects to
-    # support rules referencing more than 63 fields without dropping NULLs.
+    # support rules referencing more than 63 fields. json_patch omits members
+    # whose value is NULL, which json_extract reads back as NULL all the same.
     objects = [
         "json_object("
         + ", ".join(f"{literal(k)}, {v}" for k, v in pairs[i : i + 30])
@@ -237,7 +237,7 @@ class CorrelationCompiler:
 
     def source(self, rule):
         if not isinstance(rule, SigmaCorrelationRule):
-            raw, flag, table_id = self.raw[id(rule)]
+            raw, flag, _ = self.raw[id(rule)]
             return (
                 f"SELECT 'e:' || eid AS eid, ts, payload, json_array(eid) AS evidence, "
                 f"'[]' AS children FROM {raw} WHERE {flag}"
@@ -446,15 +446,13 @@ class CorrelationCompiler:
                         if len(times) > 1
                         else (times[0] if times else "NULL")
                     )
+                    # Optional stages in a count condition may be absent. The
+                    # last non-NULL chosen time must still constrain later stages.
                     after = (
-                        f" AND (a.{times[-1]} IS NULL OR m.ts > {previous})"
+                        f" AND ({previous} IS NULL OR m.ts > {previous})"
                         if times
                         else ""
                     )
-                    # Optional stages in a count condition may be absent. The
-                    # last non-NULL chosen time must still constrain later stages.
-                    if times:
-                        after = f" AND ({previous} IS NULL OR m.ts > {previous})"
                     t = f"q{si}"
                     sequence = self.add(
                         name + f"_seq{si}",
@@ -592,7 +590,10 @@ class CorrelationCompiler:
             f"SELECT alert_id, group_keys, end AS occurrence_time, start AS window_start, "
             f"end AS window_end, {literal(kind)} AS metric_name, metric AS metric_value, "
             f"json_array_length(evidence) AS event_count, evidence AS event_ids, "
-            f"children AS child_alert_ids FROM {root}"
+            f"children AS child_alert_ids FROM {root} "
+            # Alert IDs are numbered by group first; report in time order so a
+            # consumer's LIMIT keeps the earliest occurrences.
+            f"ORDER BY occurrence_time, alert_id"
         )
         ctes = ", ".join(f"{s.name} AS ({s.select})" for s in self.stages)
         diagnostics = " UNION ALL ".join(self.diagnostic_queries)

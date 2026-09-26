@@ -537,3 +537,52 @@ def test_zero_value_count_can_be_chained():
     rows = execute([detection(), child, parent], [event(0, User=None)])
     assert rows[0]["metric_value"] == 1
     assert rows[0]["event_ids"] == ["0:1"]
+
+
+def plan_for(docs):
+    return json.loads(
+        sqliteBackend(event_id_field="row_id").convert(
+            SigmaCollection.from_yaml(yaml.safe_dump_all(docs)), "zircolite"
+        )
+    )[-1]["correlation_plan"]
+
+
+def test_evidence_is_fetched_with_one_scan_per_source_table():
+    # More evidence IDs than the old 400-ID chunking, which scanned once per chunk.
+    events = [event(i * 0.05) for i in range(900)]
+    con = database(events)
+    statements = []
+    con.set_trace_callback(statements.append)
+    try:
+        rows, _ = execute_plan(con, plan_for([detection(), correlation()]))
+    finally:
+        con.set_trace_callback(None)
+        con.close()
+    assert len({i for r in rows for i in r["event_ids"]}) == 900
+    assert all([e["event_id"] for e in r["evidence"]] == r["event_ids"] for r in rows)
+    assert len([s for s in statements if s.startswith("SELECT CAST(")]) == 1
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_alerts_are_ordered_by_occurrence_time(materialized):
+    # Alert IDs are numbered by group first, so "a" would precede "b" unordered.
+    events = [event(10, Host="a"), event(11, Host="a")]
+    events += [event(0, Host="b"), event(1, Host="b")]
+    rows = execute([detection(), correlation()], events, materialized=materialized)
+    assert [r["group_keys"]["Host"] for r in rows] == ["b", "a"]
+
+
+def test_limit_keeps_the_earliest_alerts():
+    con = database(
+        [
+            event(10, Host="a"),
+            event(11, Host="a"),
+            event(0, Host="b"),
+            event(1, Host="b"),
+        ]
+    )
+    try:
+        rows, _ = execute_plan(con, plan_for([detection(), correlation()]), limit=0)
+    finally:
+        con.close()
+    assert [r["group_keys"]["Host"] for r in rows] == ["b"]

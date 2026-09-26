@@ -1,7 +1,6 @@
 import pytest
 from sigma.collection import SigmaCollection
 from sigma.backends.sqlite import sqliteBackend
-from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
 
 
 @pytest.fixture
