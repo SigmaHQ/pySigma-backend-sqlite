@@ -202,6 +202,29 @@ def test_sqlite_cidr_query(sqlite_backend: sqliteBackend):
     )
 
 
+def test_sqlite_cidr_ipv6_prefix_ending_in_zero_groups(sqlite_backend: sqliteBackend):
+    # pySigma 1.5.0 expanded this to field='2001:db8::', which matches no host in
+    # the network: its compressed broadcast address merely extends the network's.
+    assert (
+        sqlite_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    field|cidr: 2001:db8::/64
+                condition: sel
+        """
+            )
+        )
+        == ["SELECT * FROM logs WHERE field LIKE '2001:db8::%' ESCAPE '\\'"]
+    )
+
+
 def test_sqlite_field_name_with_whitespace(sqlite_backend: sqliteBackend):
     assert (
         sqlite_backend.convert(

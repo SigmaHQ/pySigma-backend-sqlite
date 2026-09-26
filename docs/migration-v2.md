@@ -7,7 +7,7 @@ distributing version-2 rulesets to it.
 
 ## Dependencies and configuration
 
-- pySigma >=1.5,<2; Python >=3.10; SQLite >=3.38 with JSON for correlations.
+- pySigma >=1.5.1,<2 (1.5.0 mis-expands some IPv6 CIDR prefixes); Python >=3.10; SQLite >=3.38 with JSON for correlations.
 - The default table is now `logs` in both formats. Supply `table=` for another
   table. Identifiers and pipeline-selected table names are quoted correctly.
 - Constructor options now work. Existing callers that set attributes continue
