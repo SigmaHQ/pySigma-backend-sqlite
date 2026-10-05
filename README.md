@@ -19,8 +19,8 @@ This backend is currently maintained by:
 
 ## Requirements
 
-* Python 3.10 or later
-* [pySigma](https://github.com/SigmaHQ/pySigma) `>= 1.5.1, < 2.0`
+* Python 3.11 or later
+* [pySigma](https://github.com/SigmaHQ/pySigma) `>= 2.0, < 3.0`
 
 ## Supported Features
 

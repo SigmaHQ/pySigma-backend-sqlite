@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         os: [ 'ubuntu-latest' ]
-        python-version: [ '3.10', '3.11', '3.12', '3.13', '3.14' ]
+        python-version: [ '3.11', '3.12', '3.13', '3.14' ]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: poetry install
       - name: Build minimum supported SQLite
-        if: matrix.python-version == '3.10'
+        if: matrix.python-version == '3.11'
         run: |
           curl --fail --location https://www.sqlite.org/2022/sqlite-amalgamation-3380000.zip --output /tmp/sqlite-min.zip
           unzip -q /tmp/sqlite-min.zip -d /tmp
