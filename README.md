@@ -176,3 +176,10 @@ SQLITE_MIN_BINARY=/path/to/sqlite-3.38 poetry run pytest tests/test_sqlite_minim
 `tools/audit_corpus.py` converts and prepares a SigmaHQ checkout per profile (see
 [coverage](docs/keyword-search.md#coverage)).
 `tools/benchmark_correlations.py` times sparse and dense correlation windows.
+`tools/benchmark_cidr.py` compares expanded and exact event queries and
+materialized correlations over indexed and unindexed IPv4 and IPv6 data.
+It checks event and evidence identities and records SQLite query plans.
+
+```shell
+poetry run python tools/benchmark_cidr.py --size 100000 --iterations 5 --output cidr.json
+```
