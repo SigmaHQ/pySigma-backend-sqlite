@@ -37,12 +37,12 @@ jobs:
       - name: Build minimum supported SQLite
         if: matrix.python-version == '3.11'
         run: |
-          curl --fail --location https://www.sqlite.org/2022/$SQLITE_MIN.zip --output /tmp/sqlite-min.zip
+          curl --fail --location "https://www.sqlite.org/2022/${SQLITE_MIN}.zip" --output /tmp/sqlite-min.zip
           unzip -q /tmp/sqlite-min.zip -d /tmp
-          cc -O2 -DSQLITE_THREADSAFE=0 /tmp/$SQLITE_MIN/shell.c /tmp/$SQLITE_MIN/sqlite3.c -lm -ldl -o /tmp/sqlite-min
+          cc -O2 -DSQLITE_THREADSAFE=0 "/tmp/$SQLITE_MIN/shell.c" "/tmp/$SQLITE_MIN/sqlite3.c" -lm -ldl -o /tmp/sqlite-min
           echo "SQLITE_MIN_BINARY=/tmp/sqlite-min" >> "$GITHUB_ENV"
           mkdir /tmp/sqlite-min-runtime
-          cc -O2 -fPIC -shared /tmp/$SQLITE_MIN/sqlite3.c -lm -ldl -o /tmp/sqlite-min-runtime/libsqlite3.so.0
+          cc -O2 -fPIC -shared "/tmp/$SQLITE_MIN/sqlite3.c" -lm -ldl -o /tmp/sqlite-min-runtime/libsqlite3.so.0
       - name: Run the suite on the minimum SQLite runtime
         if: matrix.python-version == '3.11'
         run: |
@@ -52,10 +52,10 @@ jobs:
       - name: Build current SQLite runtime
         if: matrix.python-version == '3.11'
         run: |
-          curl --fail --location https://www.sqlite.org/2026/$SQLITE_CURRENT.zip --output /tmp/sqlite-current.zip
+          curl --fail --location "https://www.sqlite.org/2026/${SQLITE_CURRENT}.zip" --output /tmp/sqlite-current.zip
           unzip -q /tmp/sqlite-current.zip -d /tmp
           mkdir /tmp/sqlite-current
-          cc -O2 -fPIC -shared /tmp/$SQLITE_CURRENT/sqlite3.c -lm -ldl -o /tmp/sqlite-current/libsqlite3.so.0
+          cc -O2 -fPIC -shared "/tmp/$SQLITE_CURRENT/sqlite3.c" -lm -ldl -o /tmp/sqlite-current/libsqlite3.so.0
           # Keep setup-python's own library path after ours.
           echo "LD_LIBRARY_PATH=/tmp/sqlite-current${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - name: Verify current SQLite runtime
@@ -65,7 +65,7 @@ jobs:
         run: poetry run pytest --cov=sigma --cov-report term --cov-report xml:cov.xml -vv
       - name: Store coverage for badge
         if: ${{ runner.os == 'Linux' }}
-        run: poetry run python print-coverage.py >> $GITHUB_ENV
+        run: poetry run python print-coverage.py >> "$GITHUB_ENV"
       - name: Create coverage badge
         # One job only: concurrent gist updates fail with 409 Conflict.
         if: ${{ github.repository == 'wagga40/pySigma-backend-sqlite' && github.event_name == 'push' && runner.os == 'Linux' && matrix.python-version == '3.14' }}
