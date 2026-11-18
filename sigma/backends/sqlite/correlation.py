@@ -27,6 +27,8 @@ from sigma.exceptions import (
     SigmaTimespanError,
 )
 
+from .cidr import required_sql_functions
+
 
 def literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
@@ -40,8 +42,9 @@ def quote(value: str) -> str:
 # A name SQLite reads as an identifier without quoting, unless it is a keyword.
 BARE_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 FULLTEXT_REPRESENTATION = "source-values-v1"
-# The largest finite double: a larger REAL is an infinity.
-MAX_REAL = "1.7976931348623157e308"
+# Strict comparisons to infinity work on SQLite 3.38 too, whose decimal
+# parser rounds the largest finite double literal up to infinity.
+SQL_INFINITY = "1e999"
 NUMERIC_KINDS = ("value_sum", "value_avg", "value_median", "value_percentile")
 
 
@@ -74,10 +77,10 @@ def numeric(expression: str) -> str:
     """Accept finite SQLite numbers and JSON-number strings, never CAST junk to 0."""
     return (
         f"CASE WHEN typeof({expression}) = 'integer' THEN {expression} "
-        f"WHEN typeof({expression}) = 'real' AND abs({expression}) <= {MAX_REAL} THEN {expression} "
+        f"WHEN typeof({expression}) = 'real' AND abs({expression}) < {SQL_INFINITY} THEN {expression} "
         f"WHEN typeof({expression}) = 'text' THEN CASE WHEN json_valid(trim({expression})) "
         f"THEN CASE WHEN json_type(trim({expression})) IN ('integer', 'real') "
-        f"AND abs(CAST({expression} AS REAL)) <= {MAX_REAL} "
+        f"AND abs(CAST({expression} AS REAL)) < {SQL_INFINITY} "
         f"THEN CAST({expression} AS REAL) END END END"
     )
 
@@ -232,7 +235,7 @@ class CorrelationCompiler:
                     (
                         fid,
                         f"CASE WHEN typeof({quote(field)})='real' "
-                        f"AND abs({quote(field)}) > {MAX_REAL} THEN NULL ELSE {quote(field)} END",
+                        f"AND abs({quote(field)}) >= {SQL_INFINITY} THEN NULL ELSE {quote(field)} END",
                     )
                     for field, fid in self.field_ids.items()
                     if field in fields
@@ -652,4 +655,12 @@ class CorrelationCompiler:
         }
         if self.fulltext_requirements:
             plan["fulltext"] = self.fulltext_requirements
+        functions = required_sql_functions(
+            state
+            for base in self.base_rules.values()
+            for state in base.get_conversion_states()
+        )
+        if functions:
+            plan["required_sql_functions"] = functions
+            plan["version"] = 4
         return "WITH " + ctes + " " + query, plan

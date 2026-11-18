@@ -9,6 +9,7 @@ import pytest
 from helpers import regexp
 from sigma.collection import SigmaCollection
 from sigma.exceptions import SigmaModifiedError, SigmaRegularExpressionError
+from sigma.filters import SigmaFilter
 from sigma.policy.profiles import TrustedPolicy
 
 from sigma.backends.sqlite import sqliteBackend
@@ -36,6 +37,32 @@ def test_fresh_process_imports_and_discovers_checkout_backend():
         capture_output=True,
         text=True,
     )
+
+
+def test_filter_with_leading_underscore_excludes_only_selected_events():
+    rules = SigmaCollection.from_dicts([rule({"EventID": 1})])
+    rules.apply_filters(
+        [
+            SigmaFilter.from_dict(
+                {
+                    "title": "Guest exclusion",
+                    "logsource": {"category": "test"},
+                    "filter": {
+                        "rules": "any",
+                        "_skip": {"User": "guest"},
+                        "condition": "not _skip",
+                    },
+                }
+            )
+        ]
+    )
+    sql = sqliteBackend().convert(rules)[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(EventID INTEGER, User TEXT)")
+        db.executemany(
+            "INSERT INTO logs VALUES(?,?)", [(1, "guest"), (1, "member"), (2, "other")]
+        )
+        assert db.execute(sql).fetchall() == [(1, "member")]
 
 
 @pytest.mark.parametrize("field", ["message", ""])

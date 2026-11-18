@@ -53,3 +53,16 @@ def test_audit_keyword_configuration_is_explicit(tmp_path):
     assert not audit_corpus.failed(result["errors"])
     assert audit_corpus.failed([dict(stage="conversion", error="Unexpected")])
     assert audit_corpus.failed([dict(stage="preparation", error="no such column")])
+
+
+def test_audit_exact_cidr_registers_required_function(tmp_path):
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "network.yml").write_text(
+        "title: Address\nlogsource: {category: test}\ndetection:\n"
+        "  network: {IP|cidr: '2001:db8::/32'}\n  condition: network\n"
+    )
+    result = audit_corpus.audit(tmp_path, "raw", cidr_mode="exact")
+    assert result["errors"] == []
+    assert result["counts"]["exact_cidr_queries"] == 1
+    assert result["counts"]["prepared_queries"] == 1

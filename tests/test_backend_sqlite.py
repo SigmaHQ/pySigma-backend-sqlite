@@ -721,13 +721,74 @@ def test_sqlite_timestamp_part(modifier, value, part):
 
 
 @pytest.mark.parametrize(
-    "modifier, value, operator",
-    [("gt", 100, ">"), ("gte", 100, ">="), ("lt", 50, "<"), ("lte", 50, "<=")],
+    "modifier, expected",
+    [("gt", [3]), ("gte", [2, 3]), ("lt", [1]), ("lte", [1, 2])],
 )
-def test_sqlite_compare(modifier, value, operator):
-    assert convert_selection({f"fieldA|{modifier}": value}) == [
-        f"SELECT * FROM logs WHERE fieldA {operator} {value}"
-    ]
+@pytest.mark.parametrize("affinity", ["TEXT COLLATE NOCASE", "NUMERIC", ""])
+def test_sqlite_compare(modifier, expected, affinity):
+    sql = convert_selection({f"fieldA|{modifier}": 10})[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute(f"CREATE TABLE logs(id INTEGER PRIMARY KEY, fieldA {affinity})")
+        db.executemany(
+            "INSERT INTO logs(fieldA) VALUES(?)",
+            [
+                ("2",),
+                ("1e1",),
+                ("20",),
+                ("unavailable",),
+                ("10px",),
+                (None,),
+                (b"99",),
+                ("1e999",),
+                (float("-inf"),),
+            ],
+        )
+        assert [row[0] for row in db.execute(sql)] == expected
+
+
+def test_numeric_comparison_preserves_integer_precision():
+    sql = convert_selection({"fieldA|gt": 2**53})[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(fieldA TEXT)")
+        db.executemany("INSERT INTO logs VALUES(?)", [(str(2**53),), (str(2**53 + 1),)])
+        assert db.execute(sql).fetchall() == [(str(2**53 + 1),)]
+
+
+@pytest.mark.parametrize(
+    ("field", "affinity", "left", "right", "extra"),
+    [
+        (
+            "Channel",
+            "TEXT COLLATE NOCASE",
+            ["Security", "Setup"],
+            ["security", "Setup"],
+            "System",
+        ),
+        ("EventID", "INTEGER", [1, 2], ["1", 2], 3),
+    ],
+)
+def test_metadata_bounds_cover_all_rows_returned_by_sql(
+    field, affinity, left, right, extra
+):
+    rule = {
+        "title": "Bounds",
+        "logsource": {"category": "test"},
+        "detection": {
+            "a": {field: left},
+            "b": {field: right},
+            "c": {field: extra},
+            "condition": "(a and b) or c",
+        },
+    }
+    entry = json.loads(
+        sqliteBackend().convert(SigmaCollection.from_dicts([rule]), "zircolite")
+    )[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute(f"CREATE TABLE logs({field} {affinity})")
+        db.executemany("INSERT INTO logs VALUES(?)", [(v,) for v in [*left, extra]])
+        results = {str(v).lower() for (v,) in db.execute(entry["rule"][0])}
+    bounds = entry[field.lower()]
+    assert not bounds or results <= {str(v).lower() for v in bounds}
 
 
 # ==================== All Modifier Tests ====================
