@@ -154,9 +154,12 @@ rows = connection.execute(query).fetchall()
 ```
 
 For sigma-cli, pass `-O cidr_mode=exact` and register the function on the connection
-that executes the SQL. IPv4 ranges with at least one fixed octet retain an indexable
-guard. Exact IPv6 may parse every candidate row, which matters on columns with many
-distinct addresses. Exact-dependent Zircolite output requires a schema-4 consumer.
+that executes the SQL. IPv4 ranges with at least one fixed octet can use a prefix
+or equality index. When an IPv6 network fixes a nonzero first group of 16 bits,
+SQLite checks that group before parsing the address, allowing any valid letter
+case or leading zeros. This check can use a compatible index. Other IPv6
+networks skip values without a colon before parsing.
+Exact-dependent Zircolite output requires a schema-4 consumer.
 Released Zircolite 4.7.1 supports expanded output. [Original CIDR report](https://github.com/SigmaHQ/pySigma-backend-sqlite/issues/17)
 
 ## Keyword search

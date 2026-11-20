@@ -185,6 +185,67 @@ def test_ipv4_guard_uses_index_and_skips_irrelevant_projected_rows(
         assert calls == expected_calls
 
 
+@pytest.mark.parametrize("case_sensitive_like", [0, 1])
+@pytest.mark.parametrize(
+    "network,matches,skip,expect_index",
+    [
+        ("2001:db8::/32", ["2001:0DB8::1", "2001:db8::2%en0"], ["2002::1"], True),
+        ("1::/16", ["1::1", "01::2", "001::3", "0001::4"], ["10::1"], True),
+        ("face::/16", ["FaCe::1", "FACE::2"], ["fac0::1"], True),
+        ("ab::/16", ["aB::1", "0Ab::2", "00AB::3"], ["ab0::1"], False),
+        ("::ffff:0:0/96", ["::FFFF:192.0.2.1", "0:0:0:0:0:ffff:c000:201"], [], False),
+        ("::/0", ["::", "0::1", "fe80::1%en0", "::ffff:192.0.2.1"], [], False),
+        ("2000::/3", ["2001::1", "3fff::1"], [], False),
+    ],
+)
+def test_ipv6_guard_filters_event_queries_and_projected_flags(
+    network, matches, skip, expect_index, case_sensitive_like, monkeypatch
+):
+    rule = cidr_rule(network)
+    query = convert([rule])[0]["rule"][0]
+    negated = convert([cidr_rule(network, condition="not s")])[0]["rule"][0]
+    plan = convert([rule, correlation()])[0]["correlation_plan"]
+    skip = [*skip, "192.0.2.1", "no address"]
+    misses = [*skip, matches[0] + "!", None, b"2001:db8::1", 42]
+    ips = [*matches, *misses]
+
+    parsed = set()
+    parse = cidr.ip_address
+
+    def record_parse(value):
+        parsed.add(value)
+        return parse(value)
+
+    monkeypatch.setattr(cidr, "ip_address", record_parse)
+    with database([event(i, User=ip) for i, ip in enumerate(ips)]) as con:
+        con.execute(f"PRAGMA case_sensitive_like={case_sensitive_like}")
+        con.execute("CREATE INDEX ip_nocase ON logs(User COLLATE NOCASE)")
+        con.execute("CREATE INDEX ip_binary ON logs(User)")
+        runtime.register_cidr(con)
+        projected = con.execute(plan["prepare"][0]["select"]).fetchall()
+        matching_ids = set(range(1, len(matches) + 1))
+        assert {int(row[0]) for row in projected if row[-1]} == matching_ids
+        assert parsed.isdisjoint(skip)
+        assert {row[0] for row in con.execute(query)} == matching_ids
+        assert {row[0] for row in con.execute(negated)} == set(
+            range(len(matches) + 1, len(ips) + 1)
+        )
+        if expect_index:
+            details = [r[3] for r in con.execute("EXPLAIN QUERY PLAN " + query)]
+            assert any("SEARCH logs USING INDEX ip_" in op for op in details)
+
+
+def test_ipv4_host_guard_validates_matches_under_rtrim_collation():
+    query = convert([cidr_rule("192.0.2.1/32")])[0]["rule"][0]
+    with sqlite3.connect(":memory:") as con:
+        con.execute("CREATE TABLE logs(User TEXT COLLATE RTRIM)")
+        con.executemany(
+            "INSERT INTO logs VALUES (?)", [("192.0.2.1",), ("192.0.2.1 ",)]
+        )
+        runtime.register_cidr(con)
+        assert con.execute(query).fetchall() == [("192.0.2.1",)]
+
+
 def test_exact_requirements_are_per_emitted_entry():
     doc = cidr_rule()
     doc["detection"].update(other={"EventID": 1}, condition=["s", "other"])

@@ -657,12 +657,29 @@ class sqliteBackend(TextQueryBackend):
             field = self.escape_and_quote_field(cond.field)
             network = cidr.network
             exact = f"{CIDR_FUNCTION}({field}, {literal(str(network))})"
-            if network.version == 6 or network.prefixlen < 8:
+            if network.version == 6:
+                hextet = network.network_address.packed[:2].hex().lstrip("0")
+                if network.prefixlen < 16 or not hextet:
+                    # A leading zero hextet can disappear into "::".
+                    return f"CASE WHEN instr({field}, ':') THEN {exact} ELSE 0 END"
+                prefixes = [hextet.zfill(n) for n in range(len(hextet), 5)]
+                if hextet.isdigit():
+                    checks = [f"{field} LIKE '{p}:%'" for p in prefixes]
+                else:
+                    # ':' and ';' are adjacent in NOCASE order. The range covers
+                    # every letter case even when LIKE is case-sensitive. The UDF
+                    # rejects the inclusive upper endpoint along with malformed IPs.
+                    checks = [
+                        f"{field} COLLATE NOCASE BETWEEN '{p}:' AND '{p};'"
+                        for p in prefixes
+                    ]
+                guard = "(" + " OR ".join(checks) + ")"
+            elif network.prefixlen < 8:
                 return exact
-            address = str(network.network_address)
-            if network.prefixlen == 32:
-                guard = f"{field} = {literal(address)}"
+            elif network.prefixlen == 32:
+                guard = f"{field} = {literal(str(network.network_address))}"
             else:
+                address = str(network.network_address)
                 prefix = ".".join(address.split(".")[: network.prefixlen // 8])
                 guard = f"{field} LIKE {literal(prefix + '.%')}"
             # The outer guard is indexable in WHERE. CASE also short-circuits the
