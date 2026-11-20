@@ -160,7 +160,7 @@ def test_exact_conversion_never_expands_cidr(monkeypatch):
     "network,expected_calls,matches",
     [
         ("10.8.0.0/13", ["10.8.0.1", "10.16.0.1", "10.bad"], ["10.8.0.1"]),
-        ("10.8.0.1/32", ["10.8.0.1"], ["10.8.0.1"]),
+        ("10.8.0.1/32", [], ["10.8.0.1"]),
     ],
 )
 def test_ipv4_guard_uses_index_and_skips_irrelevant_projected_rows(
@@ -183,6 +183,108 @@ def test_ipv4_guard_uses_index_and_skips_irrelevant_projected_rows(
         )
         con.execute(plan["prepare"][0]["select"]).fetchall()
         assert calls == expected_calls
+
+
+@pytest.mark.parametrize("case_sensitive_like", [0, 1])
+@pytest.mark.parametrize(
+    "network,matches,skip,expect_index",
+    [
+        ("2001:db8::/32", ["2001:0DB8::1", "2001:db8::2%en0"], ["2002::1"], True),
+        ("1::/16", ["1::1", "01::2", "001::3", "0001::4"], ["10::1"], True),
+        ("face::/16", ["FaCe::1", "FACE::2"], ["fac0::1"], True),
+        ("ab::/16", ["aB::1", "0Ab::2", "00AB::3"], ["ab0::1"], False),
+        ("::ffff:0:0/96", ["::FFFF:192.0.2.1", "0:0:0:0:0:ffff:c000:201"], [], False),
+        ("::/0", ["::", "0::1", "fe80::1%en0", "::ffff:192.0.2.1"], [], False),
+        ("2000::/3", ["2001::1", "3fff::1"], [], False),
+    ],
+)
+def test_ipv6_guard_filters_event_queries_and_projected_flags(
+    network, matches, skip, expect_index, case_sensitive_like, monkeypatch
+):
+    rule = cidr_rule(network)
+    query = convert([rule])[0]["rule"][0]
+    negated = convert([cidr_rule(network, condition="not s")])[0]["rule"][0]
+    plan = convert([rule, correlation()])[0]["correlation_plan"]
+    skip = [*skip, "192.0.2.1", "no address"]
+    misses = [*skip, matches[0] + "!", None, b"2001:db8::1", 42]
+    ips = [*matches, *misses]
+
+    parsed = set()
+    parse = cidr.ip_address
+
+    def record_parse(value):
+        parsed.add(value)
+        return parse(value)
+
+    monkeypatch.setattr(cidr, "ip_address", record_parse)
+    with database([event(i, User=ip) for i, ip in enumerate(ips)]) as con:
+        con.execute(f"PRAGMA case_sensitive_like={case_sensitive_like}")
+        con.execute("CREATE INDEX ip_nocase ON logs(User COLLATE NOCASE)")
+        con.execute("CREATE INDEX ip_binary ON logs(User)")
+        runtime.register_cidr(con)
+        projected = con.execute(plan["prepare"][0]["select"]).fetchall()
+        matching_ids = set(range(1, len(matches) + 1))
+        assert {int(row[0]) for row in projected if row[-1]} == matching_ids
+        assert parsed.isdisjoint(skip)
+        assert {row[0] for row in con.execute(query)} == matching_ids
+        assert {row[0] for row in con.execute(negated)} == set(
+            range(len(matches) + 1, len(ips) + 1)
+        )
+        if expect_index:
+            details = [r[3] for r in con.execute("EXPLAIN QUERY PLAN " + query)]
+            assert any("SEARCH logs USING INDEX ip_" in op for op in details)
+
+
+@pytest.mark.parametrize("collation", ["BINARY", "NOCASE", "RTRIM"])
+def test_exact_ipv4_host_runs_without_a_function(collation):
+    network = "192.0.2.1/32"
+    entry = convert([cidr_rule(network)])[0]
+    assert entry["schema_version"] == 2
+    assert "required_sql_functions" not in entry
+    query = entry["rule"][0]
+    negated = convert([cidr_rule(network, condition="not s")])[0]["rule"][0]
+    values = [
+        "192.0.2.1",
+        "192.0.2.1 ",
+        "192.0.2.1\x00",
+        "::ffff:192.0.2.1",
+        "192.000.2.1",
+        b"192.0.2.1",
+        1,
+        None,
+    ]
+    with sqlite3.connect(":memory:") as con:
+        con.execute(f"CREATE TABLE logs(id INTEGER, User TEXT COLLATE {collation})")
+        con.execute("CREATE INDEX ip ON logs(User)")
+        con.executemany("INSERT INTO logs VALUES (?, ?)", enumerate(values))
+        assert [row[0] for row in con.execute(query)] == [0]
+        assert {row[0] for row in con.execute(negated)} == set(range(1, len(values)))
+        assert any(
+            "SEARCH logs USING INDEX ip" in row[3]
+            for row in con.execute("EXPLAIN QUERY PLAN " + query)
+        )
+
+
+def test_exact_ipv4_host_prerequisites_in_correlations_and_mixed_conditions():
+    host = cidr_rule("192.0.2.1/32")
+    entry = convert([host, correlation(condition={"gte": 1})])[0]
+    plan = entry["correlation_plan"]
+    assert entry["schema_version"] == plan["version"] == 2
+    assert (
+        "required_sql_functions" not in entry and "required_sql_functions" not in plan
+    )
+    with database([event(0, User="192.0.2.1"), event(1, User="192.0.2.1 ")]) as con:
+        rows, _ = runtime.execute_plan(con, plan)
+        assert [row["event_ids"] for row in rows] == [["0:1"]]
+    host["detection"].update(
+        k=["needle"],
+        other={"User|cidr": "10.0.0.0/8"},
+        condition=["s and k", "s or other"],
+    )
+    keyword, network = convert([host], fulltext_field="text")
+    assert keyword["schema_version"] == 3 and "required_sql_functions" not in keyword
+    assert network["schema_version"] == 4
+    assert network["required_sql_functions"] == ["sigma_cidr_contains"]
 
 
 def test_exact_requirements_are_per_emitted_entry():

@@ -4,7 +4,9 @@ Security fixes cover the latest released minor line and the development branch.
 
 ## Report a vulnerability
 
-Open **Security → Advisories → Report a vulnerability** in the upstream repository. Include
+Open **Security → Advisories → Report a vulnerability** in
+`wagga40/pySigma-backend-sqlite`. This is the private reporting inbox for the
+backend, including copies installed from PyPI. Include
 the backend version, SQLite version, affected output format and a minimal example with the
 expected and observed behavior. Keep report details in the private advisory.
 [Private reporting form](https://github.com/wagga40/pySigma-backend-sqlite/security/advisories/new)

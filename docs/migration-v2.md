@@ -39,8 +39,8 @@ output before giving it 2.x rulesets.
 
 ## From 2.0 to 2.1
 
-- Requires Python 3.11+ and pySigma 2; backend 2.1.1 needs pySigma 2.0.1 or newer,
-  the upstream 2.1.2 candidate used 2.0.3.
+- Requires Python 3.11+ and pySigma 2. Backend 2.1.1 needs pySigma 2.0.1 or newer.
+  The unpublished 2.1.2 changes used pySigma 2.0.3.
 - Keyword rules convert when `fulltext_field` is set; their entries use
   `schema_version: 3` ([keyword search](keyword-search.md)). Other output keeps
   version 2. Without it they still raise `SigmaFeatureNotSupportedByBackendError`,
@@ -52,19 +52,22 @@ output before giving it 2.x rulesets.
 - A `value_count` over a list of fields raises
   `SigmaFeatureNotSupportedByBackendError` instead of a `TypeError`.
 
-## From 2.1.1 to the 2.2.0 candidate
+## From 2.1.1 to 2.2.0
 
-Regenerate queries and rulesets from their Sigma sources. This candidate bundles
+Regenerate queries and rulesets from their Sigma sources. Version 2.2.0 includes
 the unpublished 2.1.2 changes and requires pySigma 2.1.0 through the latest 2.x.
 
 - Global filters with identifiers such as `_skip` now apply correctly.
 - Numeric comparison modifiers reject malformed and nonfinite input, and compare
   numeric text by value. For example, a TEXT field holding `'2'` fails `gt: 10`.
-- Channel and EventID metadata can become unrestricted when SQLite case folding
-  or numeric affinity makes intersecting literal allow-lists ambiguous.
-- CIDR expansion remains the default. Exact-dependent exports use schema and
-  plan version 4 and declare their required SQL function. Consumers must register
-  it before execution and continue to validate any keyword text prerequisites.
+- Channel and EventID metadata use the shortest proven allow-list for an AND.
+  This preserves values SQLite may equate through case folding or numeric affinity.
+- Each detection entry declares only the fields and keyword text its condition
+  reads. Correlations collect prerequisites across their referenced predicates.
+- CIDR expansion remains the default. Exact IPv4 `/32` predicates use built-in
+  SQL. Other exact CIDRs require schema and plan version 4 and declare their
+  SQL function. Consumers must register it before execution and continue to
+  validate any keyword text prerequisites.
   [CIDR examples and registration](../README.md#cidr-matching)
 
 The bundled pySigma 2.0.3 changes also affect existing portable output.

@@ -47,11 +47,23 @@ def test_max_flat_operands_option_reads_cli_strings():
         ({"max_flat_operands": "1"}, "max_flat_operands"),
         ({"timestamp_format": "epoch"}, "timestamp_format"),
         ({"fulltext_field": ""}, "fulltext_field"),
+        ({"table": ""}, "table"),
+        ({"table": "main."}, "table"),
+        ({"timestamp_field": ""}, "timestamp_field"),
+        ({"event_id_field": ""}, "event_id_field"),
     ],
 )
 def test_invalid_options_are_rejected(options, message):
     with pytest.raises(ValueError, match=message):
         sqliteBackend(**options)
+
+
+def test_misspelled_option_warns_and_is_still_available_to_pipelines():
+    with pytest.warns(UserWarning, match="cidr_mod.*cidr_mode"):
+        backend = sqliteBackend(cidr_mod="exact", tenant="example")
+    convert_selection({"field": "value"}, backend)
+    assert backend.last_processing_pipeline.vars["backend_cidr_mod"] == "exact"
+    assert backend.last_processing_pipeline.vars["backend_tenant"] == "example"
 
 
 def test_fieldref_target_is_a_required_field():
@@ -788,7 +800,30 @@ def test_metadata_bounds_cover_all_rows_returned_by_sql(
         db.executemany("INSERT INTO logs VALUES(?)", [(v,) for v in [*left, extra]])
         results = {str(v).lower() for (v,) in db.execute(entry["rule"][0])}
     bounds = entry[field.lower()]
-    assert not bounds or results <= {str(v).lower() for v in bounds}
+    assert results <= {str(v).lower() for v in bounds}
+
+
+@pytest.mark.parametrize(
+    ("field", "broader", "narrower"),
+    [
+        ("Channel", ["Security", "System"], ["System"]),
+        ("EventID", [12, 13, 14], [12, 13]),
+    ],
+)
+def test_and_keeps_shortest_proven_allowlist(field, broader, narrower):
+    doc = {
+        "title": "Constrained by pipeline and rule",
+        "logsource": {"category": "test"},
+        "detection": {
+            "a": {field: broader},
+            "b": {field: narrower},
+            "condition": "a and b",
+        },
+    }
+    (entry,) = json.loads(
+        sqliteBackend().convert(SigmaCollection.from_dicts([doc]), "zircolite")
+    )
+    assert entry[field.lower()] == narrower
 
 
 # ==================== All Modifier Tests ====================

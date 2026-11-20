@@ -83,14 +83,43 @@ def test_keyword_predicates_execute(selection, values, expected):
     assert "_sigma_fulltext" in entry["required_fields"]
 
 
-def test_condition_list_shares_union_of_keyword_requirements():
+def test_condition_list_declares_only_the_fields_and_prerequisites_each_entry_reads():
     doc = detection(["needle"])
     doc["detection"].update(other={"EventID": 2}, condition=["selection", "other"])
-    entries = json.loads(convert([doc]))
-    assert len(entries) == 2
-    assert all(entry["schema_version"] == 3 for entry in entries)
-    assert entries[0]["fulltext"] == entries[1]["fulltext"]
-    assert all("_sigma_fulltext" in entry["required_fields"] for entry in entries)
+    keyword, ordinary = json.loads(convert([doc]))
+    assert keyword["schema_version"] == 3
+    assert keyword["required_fields"] == ["_sigma_fulltext"]
+    assert keyword["fulltext"][0]["field"] == "_sigma_fulltext"
+    assert ordinary["schema_version"] == 2
+    assert ordinary["required_fields"] == ["EventID"]
+    assert "fulltext" not in ordinary
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(EventID INTEGER)")
+        db.execute("INSERT INTO logs VALUES (2)")
+        assert db.execute(ordinary["rule"][0]).fetchall() == [(2,)]
+        with pytest.raises(ValueError, match="_sigma_fulltext"):
+            runtime.validate_fulltext(db, keyword["fulltext"])
+
+
+def test_callback_skipping_a_condition_preserves_the_next_querys_requirements():
+    doc = detection(["needle"])
+    doc["detection"].update(
+        net={"Ip|cidr": "10.0.0.0/8"}, condition=["selection", "net"]
+    )
+    backend = sqliteBackend(fulltext_field="_text", cidr_mode="exact")
+    (entry,) = json.loads(
+        backend.convert(
+            SigmaCollection.from_dicts([doc]),
+            "zircolite",
+            callback=lambda rule, fmt, index, condition, predicate: (
+                predicate if index else None
+            ),
+        )
+    )
+    assert entry["required_fields"] == ["Ip"]
+    assert entry["schema_version"] == 4
+    assert entry["required_sql_functions"] == ["sigma_cidr_contains"]
+    assert "fulltext" not in entry
 
 
 def test_correlation_inherits_keyword_requirements_and_hides_evidence_column():
