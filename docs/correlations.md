@@ -1,7 +1,8 @@
 # Correlations
 
-Every correlation type runs on SQLite's JSON functions; no custom SQL function is
-needed. A result row is one **alert occurrence**: when it happened, its window,
+Correlation stages use SQLite's built-in JSON functions. Referenced rules can
+also require registered functions for exact CIDR matching or regular expressions.
+A result row describes one **alert occurrence**, including its time, its window,
 the metric, and the events behind it. Separate bursts are separate rows. Result
 columns and plan execution are in [output format](output-format.md).
 

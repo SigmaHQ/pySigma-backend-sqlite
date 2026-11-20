@@ -5,6 +5,8 @@ import re
 import sqlite3
 from collections import Counter
 
+from .cidr import CIDR_FUNCTION
+from .cidr import register_cidr as register_cidr
 from .correlation import BARE_NAME, FULLTEXT_REPRESENTATION, quote
 
 _NAME = rf"(?:{BARE_NAME}|`(?:[^`]|``)+`)"
@@ -17,6 +19,25 @@ def _columns(connection, table):
     columns = {column[0].lower() for column in cursor.description}
     cursor.close()
     return columns
+
+
+def validate_sql_functions(connection, requirements):
+    """Check the version-4 function contract on the connection that will run the SQL."""
+    if requirements != [CIDR_FUNCTION]:
+        raise ValueError(f"Unsupported required SQL functions: {requirements!r}")
+    try:
+        result = connection.execute(
+            f"SELECT {CIDR_FUNCTION}('::1', '::1/128') = 1 "
+            f"AND {CIDR_FUNCTION}('::2', '::1/128') = 0"
+        ).fetchone()
+    except sqlite3.Error as error:
+        raise ValueError(
+            f"Required SQL function {CIDR_FUNCTION} unavailable; call register_cidr(connection)"
+        ) from error
+    if result[0] != 1:
+        raise ValueError(
+            f"Required SQL function {CIDR_FUNCTION} failed its membership check"
+        )
 
 
 def validate_fulltext(connection, requirements):
@@ -77,9 +98,9 @@ def execute_plan(
     discard-noisy-rule policy. The executor never commits the caller's work.
     Event IDs are scoped by source table; evidence carries each full source row.
     A caller may supply a cache-aware fulltext_preflight(requirements) hook;
-    without one, version-3 plans validate on every execution.
+    without one, plans requiring fulltext validate on every execution.
     """
-    if plan.get("version") not in (2, 3):
+    if plan.get("version") not in (2, 3, 4):
         raise ValueError("Unsupported correlation plan version")
     if limit is not None and limit < 0:
         raise ValueError("limit must be nonnegative")
@@ -87,7 +108,11 @@ def execute_plan(
         raise RuntimeError(
             "Correlation plans require SQLite >= 3.38 with JSON functions"
         )
-    if plan["version"] == 3:
+    if plan["version"] == 4:
+        validate_sql_functions(connection, plan.get("required_sql_functions"))
+    elif "required_sql_functions" in plan:
+        raise ValueError("Required SQL functions must be declared in a version-4 plan")
+    if plan["version"] == 3 or (plan["version"] == 4 and "fulltext" in plan):
         requirements = plan.get("fulltext")
         if fulltext_preflight is None:
             validate_fulltext(connection, requirements)

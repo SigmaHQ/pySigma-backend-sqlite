@@ -30,10 +30,13 @@ from sigma.types import (
     TimestampPart,
 )
 
+from .cidr import CIDR_FUNCTION, required_sql_functions
 from .correlation import (
     BARE_NAME,
     FULLTEXT_REPRESENTATION,
+    SQL_INFINITY,
     CorrelationCompiler,
+    literal,
     numeric,
     quote,
 )
@@ -135,7 +138,16 @@ class sqliteBackend(TextQueryBackend):
     case_sensitive_match_expression: ClassVar[str] = "{field} GLOB {value}"
 
     # Numeric comparison operators
-    compare_op_expression: ClassVar[str] = "{field} {operator} {value}"
+    # NUMERIC affinity converts complete numeric text for the equality check;
+    # CAST alone would turn malformed text into zero. Unary + removes the
+    # column affinity without changing the stored value. CAST AS NUMERIC keeps
+    # representable integers exact, including those beyond double precision.
+    compare_op_expression: ClassVar[str] = (
+        "(CASE WHEN +{field} = CAST({field} AS NUMERIC) AND "
+        f"CAST({{field}} AS NUMERIC) > -{SQL_INFINITY} AND "
+        f"CAST({{field}} AS NUMERIC) < {SQL_INFINITY} "
+        "THEN CAST({field} AS NUMERIC) END) {operator} {value}"
+    )
     compare_operators: ClassVar[dict[SigmaCompareExpression.CompareOperators, str]] = {
         SigmaCompareExpression.CompareOperators.LT: "<",
         SigmaCompareExpression.CompareOperators.LTE: "<=",
@@ -203,6 +215,7 @@ class sqliteBackend(TextQueryBackend):
     event_id_field = "rowid"
     timestamp_format = "iso"
     observation_end = None
+    cidr_mode = "expanded"
     fulltext_field: str | None = None
     timestamp_seconds_expression = (
         "ROUND((julianday({field}) - 2440587.5) * 86400000) / 1000.0"
@@ -223,6 +236,7 @@ class sqliteBackend(TextQueryBackend):
             "collate_nocase",
             "max_flat_operands",
             "fulltext_field",
+            "cidr_mode",
         }
         for key in configurable & options.keys():
             value = options[key]
@@ -235,6 +249,8 @@ class sqliteBackend(TextQueryBackend):
                 if value < 2:
                     raise ValueError("max_flat_operands must be at least 2")
             setattr(self, key, value)
+        if self.cidr_mode not in ("expanded", "exact"):
+            raise ValueError("cidr_mode must be expanded or exact")
         if self.timestamp_format not in ("iso", "unix", "unix_ms", "unix_us"):
             raise ValueError("timestamp_format must be iso, unix, unix_ms or unix_us")
         if (
@@ -564,7 +580,8 @@ class sqliteBackend(TextQueryBackend):
         # A CIDR expanding to several patterns converts into an OR; group it like pySigma
         # groups a SigmaExpansion, whatever selection or condition shape contains it.
         if (
-            isinstance(inner, ConditionFieldEqualsValueExpression)
+            self.cidr_mode == "expanded"
+            and isinstance(inner, ConditionFieldEqualsValueExpression)
             and isinstance(inner.value, SigmaCIDRExpression)
             and len(inner.value.expand()) > 1
         ):
@@ -576,6 +593,22 @@ class sqliteBackend(TextQueryBackend):
     ) -> str:
         """Conversion of field matches CIDR value expressions."""
         cidr: SigmaCIDRExpression = cond.value
+        if self.cidr_mode == "exact":
+            state.sqlite_uses_cidr = True
+            field = self.escape_and_quote_field(cond.field)
+            network = cidr.network
+            exact = f"{CIDR_FUNCTION}({field}, {literal(str(network))})"
+            if network.version == 6 or network.prefixlen < 8:
+                return exact
+            address = str(network.network_address)
+            if network.prefixlen == 32:
+                guard = f"{field} = {literal(address)}"
+            else:
+                prefix = ".".join(address.split(".")[: network.prefixlen // 8])
+                guard = f"{field} LIKE {literal(prefix + '.%')}"
+            # The outer guard is indexable in WHERE. CASE also short-circuits the
+            # function when the same predicate is projected as a correlation flag.
+            return f"({guard} AND CASE WHEN {guard} THEN {exact} ELSE 0 END)"
         expanded_cond = ConditionOR(
             [
                 ConditionFieldEqualsValueExpression(cond.field, SigmaString(network))
@@ -638,7 +671,10 @@ class sqliteBackend(TextQueryBackend):
             ]
             if not bounds:
                 return None
-            return set.intersection(*bounds)
+            # SQLite may equate different Python values (NOCASE text, or an
+            # integer and its string spelling). Intersecting mismatched sets
+            # can discard a matching branch even when the intersection is nonempty.
+            return bounds[0] if all(bound == bounds[0] for bound in bounds) else None
 
         if isinstance(cond, ConditionOR):
             # One unbounded branch leaves the whole disjunction unbounded.
@@ -674,6 +710,7 @@ class sqliteBackend(TextQueryBackend):
         if isinstance(rule, SigmaCorrelationRule):
             plan = self._correlation_plans.pop(id(rule))
             fulltext = plan.get("fulltext", [])
+            sql_functions = plan.get("required_sql_functions", [])
             channels, event_ids = [], []
             kind = {
                 # Zircolite's own converter sets this; it is what keeps a correlation rule out
@@ -687,6 +724,7 @@ class sqliteBackend(TextQueryBackend):
             }
         else:
             fulltext = self.fulltext_requirements(rule, state.processing_state)
+            sql_functions = required_sql_functions([state])
             # Channels and event IDs the rule's condition provably requires
             channels = self._extract_field_values_from_rule(rule, "Channel", index)
             event_ids = self._extract_field_values_from_rule(rule, "EventID", index)
@@ -720,6 +758,9 @@ class sqliteBackend(TextQueryBackend):
         if fulltext:
             zircolite_rule["fulltext"] = fulltext
         zircolite_rule["schema_version"] = 3 if fulltext else 2
+        if sql_functions:
+            zircolite_rule["required_sql_functions"] = sql_functions
+            zircolite_rule["schema_version"] = 4
         return zircolite_rule
 
     def finalize_output_zircolite(self, queries: list[dict]) -> str:

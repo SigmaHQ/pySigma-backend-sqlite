@@ -38,7 +38,7 @@ columns, so databases ingested without it must be re-ingested.
 - Keyword-dependent `zircolite` entries carry `schema_version: 3` and
   `fulltext: [{"table": "logs", "field": "_sigma_fulltext", "representation": "source-values-v1"}]`,
   deduplicated and sorted. Their correlation plans use `version: 3` with the same
-  list. Everything else keeps version 2.
+  list. Exact CIDR dependencies raise both versions to 4 and preserve the fulltext declaration. Entries with neither prerequisite keep version 2.
 - `runtime.validate_fulltext(connection, entry["fulltext"])` checks the column
   exists and every row holds non-NULL TEXT, raising `ValueError` otherwise. Run it
   before adding other missing columns or executing the SQL; `execute_plan` runs it
@@ -46,7 +46,7 @@ columns, so databases ingested without it must be re-ingested.
 - Never create a `fulltext` column empty or NULL: a missing search text must fail,
   not silently match nothing.
 - Hide the column from displayed or exported rows. `execute_plan` strips it from
-  the evidence of version-3 plans only; version-2 plans carry no `fulltext`
+  the evidence of plans declaring keyword prerequisites; version-2 plans carry no `fulltext`
   metadata, so strip it yourself.
 
 ## Cost
@@ -59,16 +59,16 @@ use a B-tree index, so keyword predicates scan the rows they are applied to.
 
 ## Coverage
 
-At Sigma revision `2e8fd89f82d9104c1b30321a307254ddeea17de2`, with
+At Sigma revision `088855f00b65a19e345b09c1619272b44f92fea4`, with
 `--fulltext-field _sigma_fulltext`, every standard rule converts and prepares
 without errors:
 
 | Profile | Rules | Keyword rules |
 | --- | ---: | ---: |
-| `raw` (no pipeline) | 3,144 | 86 |
-| `windows-sysmon` | 2,410 | 12 |
-| `windows-audit` | 2,410 | 12 |
-| `linux` | 210 | 28 |
+| `raw` (no pipeline) | 3,164 | 86 |
+| `windows-sysmon` | 2,427 | 12 |
+| `windows-audit` | 2,427 | 12 |
+| `linux` | 211 | 28 |
 
 ```sh
 poetry run python tools/audit_corpus.py /path/to/sigma \
