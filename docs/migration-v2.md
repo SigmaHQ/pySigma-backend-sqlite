@@ -64,9 +64,10 @@ the unpublished 2.1.2 changes and requires pySigma 2.1.0 through the latest 2.x.
   This preserves values SQLite may equate through case folding or numeric affinity.
 - Each detection entry declares only the fields and keyword text its condition
   reads. Correlations collect prerequisites across their referenced predicates.
-- CIDR expansion remains the default. Exact-dependent exports use schema and
-  plan version 4 and declare their required SQL function. Consumers must register
-  it before execution and continue to validate any keyword text prerequisites.
+- CIDR expansion remains the default. Exact IPv4 `/32` predicates use built-in
+  SQL. Other exact CIDRs require schema and plan version 4 and declare their
+  SQL function. Consumers must register it before execution and continue to
+  validate any keyword text prerequisites.
   [CIDR examples and registration](../README.md#cidr-matching)
 
 The bundled pySigma 2.0.3 changes also affect existing portable output.

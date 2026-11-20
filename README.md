@@ -93,7 +93,7 @@ option produces a warning so you can check which setting took effect.
 | `contains`, `startswith`, `endswith` | `LIKE '%value%' ESCAPE '\'` and its prefix/suffix forms |
 | `all` | `AND` of the values |
 | `re` | `REGEXP` (needs a registered function, see [Limitations](#limitations)) |
-| `cidr` | `=` or `LIKE` in expanded mode, registered membership function in exact mode |
+| `cidr` | Expanded mode uses `=` or `LIKE`. Exact mode uses equality for IPv4 `/32` and a registered membership function for other networks |
 | `cased` | `GLOB`; literal `*`, `?`, `[` become `[*]`, `[?]`, `[[]` |
 | `fieldref` | `field1=field2`, or `LIKE` with the second field's `%` and `_` escaped |
 | `exists` | `IS NOT NULL` / `IS NULL` |
@@ -159,8 +159,9 @@ or equality index. When an IPv6 network fixes a nonzero first group of 16 bits,
 SQLite checks that group before parsing the address, allowing any valid letter
 case or leading zeros. This check can use a compatible index. Other IPv6
 networks skip values without a colon before parsing.
-Exact-dependent Zircolite output requires a schema-4 consumer.
-Released Zircolite 4.7.1 supports expanded output. [Original CIDR report](https://github.com/SigmaHQ/pySigma-backend-sqlite/issues/17)
+Exact IPv4 `/32` uses a built-in SQLite comparison. Zircolite 4.7.1 can run
+these entries without registering a function. Entries that use the CIDR
+function require a schema-4 consumer. [Original CIDR report](https://github.com/SigmaHQ/pySigma-backend-sqlite/issues/17)
 
 ## Keyword search
 

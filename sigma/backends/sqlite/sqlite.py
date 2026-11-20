@@ -653,9 +653,15 @@ class sqliteBackend(TextQueryBackend):
         """Conversion of field matches CIDR value expressions."""
         cidr: SigmaCIDRExpression = cond.value
         if self.cidr_mode == "exact":
-            state.sqlite_uses_cidr = True
             field = self.escape_and_quote_field(cond.field)
             network = cidr.network
+            if network.version == 4 and network.prefixlen == 32:
+                # IPv4 hosts have one valid spelling. The first comparison can
+                # use the column's index. BINARY rejects collation equivalents
+                # such as trailing spaces under RTRIM. IS returns false for NULL.
+                host = literal(str(network.network_address))
+                return f"({field} IS {host} AND {field} COLLATE BINARY IS {host})"
+            state.sqlite_uses_cidr = True
             exact = f"{CIDR_FUNCTION}({field}, {literal(str(network))})"
             if network.version == 6:
                 hextet = network.network_address.packed[:2].hex().lstrip("0")
@@ -676,8 +682,6 @@ class sqliteBackend(TextQueryBackend):
                 guard = "(" + " OR ".join(checks) + ")"
             elif network.prefixlen < 8:
                 return exact
-            elif network.prefixlen == 32:
-                guard = f"{field} = {literal(str(network.network_address))}"
             else:
                 address = str(network.network_address)
                 prefix = ".".join(address.split(".")[: network.prefixlen // 8])
