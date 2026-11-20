@@ -1,6 +1,8 @@
 import json
 import math
 import re
+import warnings
+from difflib import get_close_matches
 from typing import Any, ClassVar
 
 from sigma.conditions import (
@@ -238,6 +240,14 @@ class sqliteBackend(TextQueryBackend):
             "fulltext_field",
             "cidr_mode",
         }
+        for key in options.keys() - configurable:
+            close = get_close_matches(key, configurable, n=1, cutoff=0.8)
+            if close:
+                warnings.warn(
+                    f"Unknown SQLite option {key!r}. Did you mean {close[0]!r}? "
+                    "The supplied option is forwarded to the processing pipeline.",
+                    stacklevel=2,
+                )
         for key in configurable & options.keys():
             value = options[key]
             if key == "collate_nocase" and isinstance(value, str):
@@ -268,11 +278,14 @@ class sqliteBackend(TextQueryBackend):
                 finite = False
             if not finite:
                 raise ValueError("observation_end must be finite Unix seconds")
+        self._quoted_table(self.table)
+        for name in ("timestamp_field", "event_id_field", "fulltext_field"):
+            value = getattr(self, name)
+            if name == "fulltext_field" and value is None:
+                continue
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise ValueError(f"{name} must be a nonempty column name without NUL")
         self._correlation_plans = {}
-        if self.fulltext_field is not None and (
-            not isinstance(self.fulltext_field, str) or not self.fulltext_field
-        ):
-            raise ValueError("fulltext_field must be a nonempty column name")
         super().__init__(processing_pipeline, collect_errors, **options)
 
     def convert_condition_field_eq_field(self, cond, state):
@@ -283,8 +296,12 @@ class sqliteBackend(TextQueryBackend):
         return expression
 
     def resolve_table(self, state=None):
-        table = (state or {}).get("table") or self.table
-        # Keep simple names readable, quote every component of a qualified name.
+        table = (state or {}).get("table")
+        return self._quoted_table(self.table if table is None else table)
+
+    def _quoted_table(self, table):
+        if not isinstance(table, str) or "\x00" in table or not all(table.split(".")):
+            raise ValueError("table must have nonempty name components without NUL")
         return ".".join(self.escape_and_quote_field(part) for part in table.split("."))
 
     def escape_and_quote_field(self, field):
@@ -298,9 +315,10 @@ class sqliteBackend(TextQueryBackend):
         field = self.escape_and_quote_field(self.timestamp_field)
         return self.timestamp_seconds_expression.format(field=field)
 
-    def required_fields(self, rule):
+    def required_fields(self, rule, index=None):
         fields = set()
-        for condition in rule.detection.parsed_condition:
+        conditions = rule.detection.parsed_condition
+        for condition in conditions if index is None else (conditions[index],):
             for cond in _walk(condition.parsed):
                 if isinstance(cond, ConditionFieldEqualsValueExpression):
                     if cond.field:
@@ -311,17 +329,15 @@ class sqliteBackend(TextQueryBackend):
                     fields.add(self.fulltext_field)
         return sorted(fields)
 
-    def fulltext_requirements(self, rule, state=None):
+    def fulltext_requirements(self, rule, state=None, index=None):
         if self.fulltext_field is None:
             return []
-        if state is None:
-            states = [item.processing_state for item in rule.get_conversion_states()]
-        else:
-            states = [state] * len(rule.detection.parsed_condition)
+        conditions = rule.detection.parsed_condition
+        states = rule.get_conversion_states() if state is None else None
         tables = {
-            self.resolve_table(states[i])
-            for i, condition in enumerate(rule.detection.parsed_condition)
-            if any(map(_is_keyword, _walk(condition.parsed)))
+            self.resolve_table(states[i].processing_state if state is None else state)
+            for i in (range(len(conditions)) if index is None else (index,))
+            if any(map(_is_keyword, _walk(conditions[i].parsed)))
         }
         return [
             {
@@ -349,6 +365,13 @@ class sqliteBackend(TextQueryBackend):
             return []
 
     def convert_rule(self, rule, output_format=None, callback=None):
+        if rule._backreferences:
+            # pySigma keeps the previous result if converting this rule fails.
+            # Dependents must only see predicates from the current conversion.
+            rule.set_conversion_result([])
+            rule.set_conversion_states([])
+        if callback is not None and output_format == "zircolite":
+            return self._convert_selected_entries(rule, callback)
         queries = super().convert_rule(rule, output_format, callback)
         # pySigma stores predicates for referenced rules. generate:true must
         # still emit finalized standalone queries without overwriting them.
@@ -368,6 +391,42 @@ class sqliteBackend(TextQueryBackend):
                 for i, query in enumerate(queries)
             ]
         return queries
+
+    def _convert_selected_entries(self, rule, callback):
+        # pySigma numbers finalized queries after removing skipped conditions.
+        # Keep their original indices so each entry uses its own conversion state.
+        selected = []
+
+        def select(rule, fmt, index, condition, predicate):
+            result = callback(rule, fmt, index, condition, predicate)
+            if result is not None:
+                selected.append((index, result))
+            # Defer finalization until pySigma has stored the conversion states.
+            return None
+
+        error_count = len(self.errors)
+        super().convert_rule(rule, "zircolite", select)
+        if not selected or len(self.errors) != error_count:
+            return []
+        states = rule.get_conversion_states()
+        raw = rule._backreferences and not self.finalize_correlation_subqueries
+        if raw:
+            rule.set_conversion_result([query for _, query in selected])
+            if not rule._output:
+                return []
+        try:
+            entries = [
+                self.finalize_query(rule, query, i, states[i], "zircolite")
+                for i, query in selected
+            ]
+        except SigmaError as error:
+            if not self.collect_errors:
+                raise
+            self.errors.append((rule, error))
+            return []
+        if not raw:
+            rule.set_conversion_result(entries)
+        return entries if rule._output else []
 
     def convert_correlation_rule_from_template(self, rule, correlation_type, method):
         query, plan = CorrelationCompiler(self, rule).compile()
@@ -669,12 +728,9 @@ class sqliteBackend(TextQueryBackend):
                 )
                 if bound is not None
             ]
-            if not bounds:
-                return None
-            # SQLite may equate different Python values (NOCASE text, or an
-            # integer and its string spelling). Intersecting mismatched sets
-            # can discard a matching branch even when the intersection is nonempty.
-            return bounds[0] if all(bound == bounds[0] for bound in bounds) else None
+            # A Python intersection can discard values equivalent under SQLite
+            # affinity or collation. Every AND operand independently bounds the result.
+            return min(bounds, key=len, default=None)
 
         if isinstance(cond, ConditionOR):
             # One unbounded branch leaves the whole disjunction unbounded.
@@ -723,13 +779,13 @@ class sqliteBackend(TextQueryBackend):
                 "result_type": "correlation",
             }
         else:
-            fulltext = self.fulltext_requirements(rule, state.processing_state)
+            fulltext = self.fulltext_requirements(rule, state.processing_state, index)
             sql_functions = required_sql_functions([state])
             # Channels and event IDs the rule's condition provably requires
             channels = self._extract_field_values_from_rule(rule, "Channel", index)
             event_ids = self._extract_field_values_from_rule(rule, "EventID", index)
             kind = {
-                "required_fields": self.required_fields(rule),
+                "required_fields": self.required_fields(rule, index),
                 "result_type": "event",
                 "source_table": self.resolve_table(state.processing_state),
                 "logsource": {

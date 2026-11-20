@@ -21,6 +21,7 @@ from sigma.correlations import (
     SigmaRuleReference,
 )
 from sigma.exceptions import (
+    SigmaConversionError,
     SigmaCorrelationConditionError,
     SigmaCorrelationRuleError,
     SigmaFeatureNotSupportedByBackendError,
@@ -133,6 +134,7 @@ class CorrelationCompiler:
         self.nodes = {}
         self.active = set()
         self.base_rules = {}
+        self.predicates = {}
         self.fields = set()
         self.required_by_table: dict[str, set[str]] = {}
         self.source_tables = {}
@@ -175,9 +177,32 @@ class CorrelationCompiler:
                 self.fields.update(alias.mapping.values())
             for ref in rule.referenced_rules:
                 self._discover(ref.rule)
-        else:
+        elif id(rule) not in self.base_rules:
+            self.predicates[id(rule)] = self._compiled_predicate(rule)
             self.base_rules[id(rule)] = rule
         self.active.remove(id(rule))
+
+    def _compiled_predicate(self, rule):
+        # A collected detection error leaves pySigma's result and states unset.
+        # Check both before reading the states for table and full-text metadata.
+        try:
+            queries = rule.get_conversion_result()
+            states = rule.get_conversion_states()
+        except SigmaConversionError:
+            pass
+        else:
+            if (
+                states
+                and isinstance(queries, list)
+                and queries
+                and all(isinstance(q, str) and q.strip() for q in queries)
+            ):
+                return self.backend._join_operands([f"({q})" for q in queries], " OR ")
+        raise SigmaCorrelationRuleError(
+            f"Correlation {self.root.title!r} references {rule.title!r}, "
+            "which has no compiled predicates",
+            source=self.root.source,
+        )
 
     @staticmethod
     def _alias_mapping(rule, ref):
@@ -241,19 +266,10 @@ class CorrelationCompiler:
                     if field in fields
                 ]
             )
-            flags = []
-            for j, rule in enumerate(rules):
-                queries = rule.get_conversion_result()
-                if not queries or any(not isinstance(q, str) for q in queries):
-                    raise SigmaCorrelationRuleError(
-                        f"Correlation {self.root.title!r} references {rule.title!r}, "
-                        "which has no compiled predicates",
-                        source=self.root.source,
-                    )
-                predicate = self.backend._join_operands(
-                    [f"({q})" for q in queries], " OR "
-                )
-                flags.append(f"COALESCE(({predicate}), 0) AS b{j}")
+            flags = [
+                f"COALESCE(({self.predicates[id(rule)]}), 0) AS b{j}"
+                for j, rule in enumerate(rules)
+            ]
             time = self.backend._correlation_timestamp()
             event_id = f"CAST({quote(self.backend.event_id_field)} AS TEXT)"
             raw = self.add(

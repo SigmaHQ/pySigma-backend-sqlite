@@ -46,7 +46,9 @@ Thresholds may be fractional (pySigma 2) and are compared exactly:
 ## Values
 
 - Statistics ignore NULL, invalid and nonfinite values. Numeric text must be a
-  valid JSON number (`12`, `-2.5`, `1e3`).
+  valid JSON number (`12`, `-2.5`, `1e3`). Text values such as `+11`, `11.`
+  and `011` are excluded from these statistics. A detection using `|gt` or
+  another numeric comparison treats those same text values as eleven.
 - Percentiles interpolate linearly at rank `(n - 1) * p / 100`; percentile 50
   equals the median, even for even sample sizes.
 - Sums use SQLite REAL arithmetic to avoid integer overflow; very large integers

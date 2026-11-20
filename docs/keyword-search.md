@@ -35,6 +35,9 @@ columns, so databases ingested without it must be re-ingested.
 
 ## Contract
 
+- Each condition in a detection's condition list has its own entry. A
+  field-only condition can run on a database without a keyword text column
+  even when another condition in the same rule uses a keyword.
 - Keyword-dependent `zircolite` entries carry `schema_version: 3` and
   `fulltext: [{"table": "logs", "field": "_sigma_fulltext", "representation": "source-values-v1"}]`,
   deduplicated and sorted. Their correlation plans use `version: 3` with the same

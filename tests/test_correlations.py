@@ -10,7 +10,11 @@ import pytest
 import yaml
 from helpers import correlation, database, detection, event, execute
 from sigma.collection import SigmaCollection
-from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
+from sigma.exceptions import (
+    SigmaConditionError,
+    SigmaCorrelationRuleError,
+    SigmaFeatureNotSupportedByBackendError,
+)
 
 from sigma.backends.sqlite import sqliteBackend
 from sigma.backends.sqlite.runtime import execute_plan
@@ -297,6 +301,67 @@ def test_collect_errors_skips_only_failing_correlations():
         "search",
         "searched",
     ]
+
+
+@pytest.mark.parametrize("fulltext_field", [None, "message"])
+def test_failed_detection_reports_each_dependent_correlation(fulltext_field):
+    broken = detection("broken")
+    broken["detection"]["condition"] = "missing"
+    docs = [
+        broken,
+        correlation(refs=("broken",), name="child"),
+        correlation(refs=("child",), name="parent"),
+        detection("independent"),
+    ]
+    backend = sqliteBackend(collect_errors=True, fulltext_field=fulltext_field)
+    entries = json.loads(backend.convert(SigmaCollection.from_dicts(docs), "zircolite"))
+    assert [entry["title"] for entry in entries] == ["independent"]
+    errors = {rule.title: error for rule, error in backend.errors}
+    assert errors.keys() == {"broken", "child", "parent"}
+    assert isinstance(errors["broken"], SigmaConditionError)
+    assert "missing" in str(errors["broken"])
+    for title in ("child", "parent"):
+        assert isinstance(errors[title], SigmaCorrelationRuleError)
+        assert str(errors[title]) == (
+            f"Correlation {title!r} references 'broken', which has no compiled predicates"
+        )
+
+
+def test_failed_reconversion_invalidates_a_previous_correlation_predicate():
+    keyword = dict(detection(), detection={"k": ["needle"], "condition": "k"})
+    rules = SigmaCollection.from_dicts([keyword, correlation()])
+    assert len(sqliteBackend(fulltext_field="message").convert(rules)) == 1
+    backend = sqliteBackend(collect_errors=True)
+    assert backend.convert(rules) == []
+    assert [rule.title for rule, _ in backend.errors] == ["a", "corr"]
+    assert isinstance(backend.errors[-1][1], SigmaCorrelationRuleError)
+
+
+@pytest.mark.parametrize("result", [None, {}, " "])
+def test_correlation_requires_a_nonempty_text_predicate(result):
+    backend = sqliteBackend(collect_errors=True)
+    rules = SigmaCollection.from_dicts([detection(), correlation()])
+    assert backend.convert(rules, callback=lambda *_: result) == []
+    [(rule, error)] = backend.errors
+    assert rule.title == "corr"
+    assert isinstance(error, SigmaCorrelationRuleError)
+    assert (
+        str(error)
+        == "Correlation 'corr' references 'a', which has no compiled predicates"
+    )
+
+
+def test_correlation_requires_conversion_states_for_stored_predicates():
+    rules = SigmaCollection.from_dicts([detection(), correlation()])
+    rules.resolve_rule_references()
+    base, dependent = rules.rules
+    base.set_conversion_result(["EventID=1"])
+    with pytest.raises(SigmaCorrelationRuleError) as exc:
+        sqliteBackend().convert_correlation_rule(dependent)
+    assert (
+        str(exc.value)
+        == "Correlation 'corr' references 'a', which has no compiled predicates"
+    )
 
 
 @pytest.mark.parametrize("value", ["soon", float("inf"), float("nan")])

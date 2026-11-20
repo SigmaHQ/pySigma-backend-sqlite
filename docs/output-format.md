@@ -21,8 +21,9 @@ The `zircolite` format is a JSON list with one entry per converted condition or 
 | `schema_version` | `4` for exact CIDR, `3` for keyword-only prerequisites, otherwise `2` |
 | `filename` | Empty; kept for Zircolite's rule format |
 
-A detection with a condition list emits separate entries. Each entry carries the rule-wide
-keyword text prerequisites and the SQL functions used by its own condition.
+A detection with a condition list emits separate entries. Each entry declares
+the fields, keyword text and SQL functions its condition uses. A correlation
+plan collects requirements across the referenced predicates it evaluates.
 
 Load related rule files into one collection: correlations resolve the rules they
 reference by name. For events from several files, use one database;
