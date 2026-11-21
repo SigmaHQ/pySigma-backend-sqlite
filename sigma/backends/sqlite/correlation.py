@@ -49,6 +49,15 @@ SQL_INFINITY = "1e999"
 NUMERIC_KINDS = ("value_sum", "value_avg", "value_median", "value_percentile")
 
 
+def json_array_function(tables):
+    """A source table named json_each shadows SQLite's eponymous virtual table."""
+    for table in tables:
+        name = table.rsplit(".", 1)[-1]
+        if name.lower() in ("json_each", "`json_each`"):
+            return "json_tree"
+    return "json_each"
+
+
 def digest(rule, length: int) -> str:
     """Stable hex identity of a rule's content."""
     identity = json.dumps(rule.to_dict(), sort_keys=True, default=str)
@@ -76,19 +85,36 @@ def json_object(pairs: list[tuple[str, str]]) -> str:
 
 def numeric(expression: str) -> str:
     """Accept finite SQLite numbers and JSON-number strings, never CAST junk to 0."""
+    number = f"json_extract(trim({expression}), '$')"
     return (
         f"CASE WHEN typeof({expression}) = 'integer' THEN {expression} "
         f"WHEN typeof({expression}) = 'real' AND abs({expression}) < {SQL_INFINITY} THEN {expression} "
-        f"WHEN typeof({expression}) = 'text' THEN CASE WHEN json_valid(trim({expression})) "
-        f"THEN CASE WHEN json_type(trim({expression})) IN ('integer', 'real') "
-        f"AND abs(CAST({expression} AS REAL)) < {SQL_INFINITY} "
-        f"THEN CAST({expression} AS REAL) END END END"
+        f"WHEN typeof({expression}) = 'text' AND instr({expression},char(0))=0 "
+        f"THEN CASE WHEN json_valid(trim({expression})) THEN CASE "
+        f"WHEN json_type(trim({expression})) IN ('integer', 'real') "
+        f"AND abs(CAST({expression} AS REAL)) < {SQL_INFINITY} THEN {number} END END END"
     )
 
 
-def group_key(expression: str) -> str:
-    """Sigma's default string matching is case insensitive (SQLite: ASCII)."""
-    return f"CASE WHEN typeof({expression})='text' THEN lower({expression}) ELSE {expression} END"
+def metric_fields(rule) -> list[str]:
+    field = getattr(rule.condition, "fieldref", None)
+    kind = rule.type.name.lower()
+    if field is None and kind not in (*NUMERIC_KINDS, "value_count"):
+        return []
+    if isinstance(field, list) and kind != "value_count":
+        raise SigmaCorrelationConditionError(
+            f"Correlation {rule.title!r} requires a single metric field",
+            source=rule.source,
+        )
+    fields = field if isinstance(field, list) else [field]
+    if not fields or not all(
+        isinstance(f, str) and f and "\x00" not in f for f in fields
+    ):
+        raise SigmaCorrelationConditionError(
+            f"Correlation {rule.title!r} requires nonempty metric field names without NUL",
+            source=rule.source,
+        )
+    return fields
 
 
 def terms(node, negative=False):
@@ -164,6 +190,7 @@ class CorrelationCompiler:
         self.prefix = "sigma_" + digest(root, 12)
         self.raw = {}
         self._raw_sources()
+        self.array_items = json_array_function(self.source_tables.values())
 
     def add(self, suffix, select, indexes=()):
         name = f"{self.prefix}_{suffix}"
@@ -191,13 +218,7 @@ class CorrelationCompiler:
         self.active.add(id(rule))
         if isinstance(rule, SigmaCorrelationRule):
             self.fields.update(rule.group_by or [])
-            field = getattr(rule.condition, "fieldref", None)
-            if isinstance(field, list):
-                raise SigmaFeatureNotSupportedByBackendError(
-                    f"Correlation condition field list {field} is not supported"
-                )
-            if field:
-                self.fields.add(field)
+            self.fields.update(metric_fields(rule))
             for alias in rule.aliases:
                 self.fields.add(alias.alias)
                 self.fields.update(alias.mapping.values())
@@ -252,8 +273,7 @@ class CorrelationCompiler:
         own = set(rule.group_by or []) | {rule.type.name.lower(), "sigma_metric"}
         # Parent fields not in the child's summary are propagated from evidence.
         needed = (set(wanted) - own) | set(rule.group_by or [])
-        if field := getattr(rule.condition, "fieldref", None):
-            needed.add(field)
+        needed.update(metric_fields(rule))
         for ref in rule.referenced_rules:
             mapping = self._alias_mapping(rule, ref)
             self._physical_fields(ref.rule, {mapping.get(f, f) for f in needed})
@@ -335,7 +355,7 @@ class CorrelationCompiler:
             f"SELECT DISTINCT 'c:' || c.alert_id AS eid, c.end AS ts, "
             f"json_patch(r.payload, c.payload) AS payload, c.evidence, "
             f"json_array(c.alert_id) AS children FROM {result} c "
-            f"JOIN json_each(c.evidence) e JOIN ({union}) r ON r.eid=e.value"
+            f"JOIN {self.array_items}(c.evidence) e ON e.type='text' JOIN ({union}) r ON r.eid=e.value"
         )
 
     @staticmethod
@@ -348,11 +368,14 @@ class CorrelationCompiler:
             + f"{alias}.ts BETWEEN {anchor}.start AND {anchor}.end"
         )
 
+    def group_key(self, expression):
+        return f"CASE WHEN typeof({expression})='text' THEN lower({expression}) ELSE {expression} END"
+
     def contexts(self, rule, fields):
         """Project observed context through the same aliases as rule membership."""
         if not isinstance(rule, SigmaCorrelationRule):
             columns = "".join(
-                f", {group_key(self._field('payload', field))} AS g{i}"
+                f", {self.group_key(self._field('payload', field))} AS g{i}"
                 for i, field in enumerate(fields)
             )
             return [
@@ -363,6 +386,96 @@ class CorrelationCompiler:
             mapping = self._alias_mapping(rule, ref)
             sources.extend(self.contexts(ref.rule, [mapping.get(f, f) for f in fields]))
         return sources
+
+    def portable_sum(self, stem, events, gs, partition, frame):
+        """Sum the signed high and unsigned low halves, then propagate the carry.
+
+        Each accumulator fits int64 for a partition of up to 2**31 rows.
+        Guard their inputs so SQLite never accumulates an overflowing integer,
+        even when the final total overflows or sliding-window sums cancel.
+        """
+        groups = "".join(f", {g}" for g in gs)
+        sized = self.add(
+            stem + "_sizes",
+            f"SELECT *, COUNT(*) OVER ({partition}) AS n FROM {events}",
+        )
+        integer = "typeof(v)='integer' AND n <= 2147483648"
+        totals = self.add(
+            stem + "_sums",
+            f"SELECT DISTINCT ts AS end{groups}, "
+            f"SUM(v >> 32) FILTER (WHERE {integer}) OVER w AS hi, "
+            f"SUM(v & 4294967295) FILTER (WHERE {integer}) OVER w AS lo, "
+            f"COUNT(v) FILTER (WHERE NOT ({integer})) OVER w AS other, "
+            f"SUM(CAST(v AS REAL)) OVER w AS fallback FROM {sized} WINDOW w AS ({frame})",
+        )
+        high = "(hi + (lo >> 32))"
+        return self.add(
+            stem + "_metrics",
+            f"SELECT end{groups}, CASE WHEN other=0 AND {high} BETWEEN -2147483648 AND 2147483647 "
+            f"THEN ({high} << 32) | (lo & 4294967295) ELSE fallback END AS metric FROM {totals}",
+            [gs + ["end"]],
+        )
+
+    def ordered_threshold(self, rule, stem, matches, gs, span):
+        """Find the union of greedy ordered witnesses without enumerating subsets.
+
+        An edge into a slot chooses its first timestamp after the predecessor.
+        Prefixes ending at the same (window, slot, time, length) have identical
+        continuations. Trace winning prefixes backward to retain exactly the
+        events that the successful branches would have contributed.
+        """
+        nslots = len(rule.referenced_rules)
+        op = self.backend.correlation_condition_mapping[rule.condition.op]
+        count = rule.condition.count
+        groups = "".join(f", {g}" for g in gs)
+        ag = "".join(f", a.{g}" for g in gs)
+        wg = "".join(f", w.{g}" for g in gs)
+        ng = "".join(f", n.{g}" for g in gs)
+        cols = ", ".join(["end", *gs])
+        slots = ", ".join([*gs, "slot"])
+        positions = self.add(
+            stem + "_positions",
+            f"SELECT *, LAG(ts) OVER (PARTITION BY {slots} ORDER BY ts) AS prev "
+            f"FROM (SELECT DISTINCT ts, slot{groups} FROM {matches})",
+            [gs + ["ts"]],
+        )
+        anchors = f"(SELECT DISTINCT ts AS end{groups} FROM {matches})"
+        nodes = self.add(
+            stem + "_window_nodes",
+            f"SELECT a.end{ag}, p.slot, p.ts, p.prev, "
+            f"SUM(p.prev IS NULL OR p.prev < a.end-{span}) OVER "
+            f"(PARTITION BY a.end{ag}) AS metric FROM {anchors} a JOIN {positions} p "
+            f"ON {self.group_equal('p', 'a', len(gs))}p.ts BETWEEN a.end-{span} AND a.end",
+        )
+        target = "metric"
+        if op in (">", ">="):
+            target = math.floor(count) + 1 if op == ">" else math.ceil(count)
+        if target != "metric" and target <= 0:
+            # The empty subset imposes no ordering and contributes all evidence.
+            winning = nodes
+        else:
+            prefix_cols = cols + ", slot, ts, prev, metric, target"
+            same_window = self.group_equal("r", "n", len(gs)) + "r.end=n.end"
+            edge = "r.slot<n.slot AND r.ts<n.ts AND (n.prev IS NULL OR r.ts>=n.prev)"
+            winning = self.add(
+                stem + "_winning",
+                f"WITH RECURSIVE eligible AS MATERIALIZED "
+                f"(SELECT *, {target} AS target FROM {nodes} WHERE metric {op} {count}), "
+                f"prefix AS (SELECT {prefix_cols}, 1 AS depth FROM eligible "
+                f"WHERE (prev IS NULL OR prev < end-{span}) AND slot <= {nslots}-target "
+                f"UNION SELECT n.end{ng}, n.slot, n.ts, n.prev, "
+                f"n.metric, n.target, r.depth+1 FROM prefix r JOIN eligible n ON {same_window} "
+                f"AND {edge} WHERE r.depth<r.target AND n.slot <= {nslots}-n.target+r.depth), "
+                f"witness AS (SELECT * FROM prefix WHERE depth=target UNION "
+                f"SELECT r.* FROM witness n JOIN prefix r ON {same_window} AND {edge} "
+                f"AND r.depth=n.depth-1) SELECT DISTINCT {cols}, slot, ts, metric FROM witness",
+                [gs + ["slot", "ts"]],
+            )
+        return (
+            f"SELECT w.end-{span} AS start, w.end{wg}, w.metric, m.evidence, m.children "
+            f"FROM {winning} w JOIN {matches} m ON {self.group_equal('m', 'w', len(gs))}"
+            f"m.slot=w.slot AND m.ts=w.ts"
+        )
 
     def compile_node(self, rule):
         if id(rule) in self.nodes:
@@ -375,25 +488,49 @@ class CorrelationCompiler:
         count = len(group)
         gs = [f"g{i}" for i in range(count)]
         comma_groups = "".join(f", {g}" for g in gs)
-        field = getattr(rule.condition, "fieldref", None)
+        fields = metric_fields(rule)
+        value_columns = ["v"] + [f"v{i}" for i in range(1, len(fields))]
+        is_extended = isinstance(rule.condition, SigmaExtendedCorrelationCondition)
+        ordered_threshold = kind == "temporal_ordered" and not is_extended
         branches = []
+        ordered_sources = {}
         names = {}
         for slot, ref in enumerate(rule.referenced_rules):
             names[ref.reference] = slot
             names[str(ref.rule.name or ref.rule.id)] = slot
             mapping = self._alias_mapping(rule, ref)
             groups = [
-                group_key(self._field("s.payload", mapping.get(f, f))) for f in group
+                self.group_key(self._field("s.payload", mapping.get(f, f)))
+                for f in group
             ]
-            value = (
-                self._field("s.payload", mapping.get(field, field)) if field else "NULL"
-            )
+            values = [self._field("s.payload", mapping.get(f, f)) for f in fields]
             if kind in NUMERIC_KINDS:
-                value = numeric(value)
+                values = [numeric(values[0])]
             columns = "".join(f", {expr} AS g{i}" for i, expr in enumerate(groups))
+            columns += "".join(
+                f", {v} AS {col}" for v, col in zip(values or ["NULL"], value_columns)
+            )
+            if ordered_threshold and not isinstance(ref.rule, SigmaCorrelationRule):
+                for raw, flag in self.raw[id(ref.rule)]:
+                    ordered_sources.setdefault((raw, columns), []).append((slot, flag))
+            else:
+                branches.append(
+                    f"SELECT s.*, {slot} AS slot{columns} FROM ({self.source(ref.rule)}) s"
+                )
+        # Read each physical projection once. A UNION term per position expands
+        # the same raw CTE repeatedly inside SQLite's standalone query planner.
+        for (raw, columns), flags in ordered_sources.items():
+            slots = json.dumps([slot for slot, _ in flags])
+            cases = " ".join(f"WHEN {slot} THEN s.{flag}" for slot, flag in flags)
             branches.append(
-                f"SELECT s.*, {slot} AS slot{columns}, {value} AS v "
-                f"FROM ({self.source(ref.rule)}) s"
+                f"SELECT 'e:' || s.eid AS eid, s.ts, s.payload, json_array(s.eid) AS evidence, "
+                f"'[]' AS children, j.value AS slot{columns} FROM {raw} s "
+                f"JOIN {self.array_items}({literal(slots)}) j ON j.type='integer' AND CASE j.value {cases} END"
+            )
+        if len(branches) > 500:
+            raise SigmaFeatureNotSupportedByBackendError(
+                f"Correlation {rule.title!r} exceeds SQLite's limit of 500 compound SELECT terms",
+                source=rule.source,
             )
         unfiltered = self.add(stem + "_input", " UNION ALL ".join(branches))
         guard = " AND ".join(
@@ -411,7 +548,7 @@ class CorrelationCompiler:
             )
         events = self.add(
             stem + "_events",
-            f"SELECT DISTINCT eid, ts{comma_groups}, v FROM {matches}",
+            f"SELECT DISTINCT eid, ts{comma_groups}, {', '.join(value_columns)} FROM {matches}",
             [gs + ["ts"]],
         )
         span = rule.timespan.seconds
@@ -432,40 +569,24 @@ class CorrelationCompiler:
                     stem + "_unique_events",
                     f"SELECT DISTINCT eid, ts{comma_groups} FROM {events}",
                 )
-            aggregate = {
-                "event_count": "COUNT(*)",
-                "value_sum": "SUM(CAST(v AS REAL))",
-                "value_avg": "AVG(v)",
-            }[kind]
-            window_metrics = self.add(
-                stem + "_metrics",
-                f"SELECT DISTINCT ts AS end{comma_groups}, {aggregate} OVER ({frame}) AS metric "
-                f"FROM {input_relation}",
-                [gs + ["end"]],
-            )
-        is_extended = isinstance(rule.condition, SigmaExtendedCorrelationCondition)
-        clauses = terms(rule.condition.parsed) if is_extended else [(set(), set())]
-        partial_order = False
-        if kind == "temporal_ordered" and not is_extended:
-            operator = self.backend.correlation_condition_mapping[rule.condition.op]
-            if operator in (">", ">="):
-                required = max(
-                    0,
-                    (
-                        math.floor(rule.condition.count) + 1
-                        if operator == ">"
-                        else math.ceil(rule.condition.count)
-                    ),
+            if kind == "value_sum":
+                window_metrics = self.portable_sum(stem, events, gs, partition, frame)
+            else:
+                aggregate = {
+                    "event_count": "COUNT(*)",
+                    "value_avg": "AVG(v)",
+                }[kind]
+                window_metrics = self.add(
+                    stem + "_metrics",
+                    f"SELECT DISTINCT ts AS end{comma_groups}, {aggregate} OVER ({frame}) AS metric "
+                    f"FROM {input_relation}",
+                    [gs + ["end"]],
                 )
-                partial_order = True
-                # A threshold of two out of three asks for an ordered pair;
-                # an unrelated out-of-order third type must not veto it.
-                references = [r.reference for r in rule.referenced_rules]
-                clauses = [
-                    (set(subset), set())
-                    for subset in itertools.combinations(references, required)
-                ]
+        clauses = terms(rule.condition.parsed) if is_extended else [(set(), set())]
         results = []
+        if ordered_threshold:
+            results.append(self.ordered_threshold(rule, stem, matches, gs, span))
+            clauses = []
         for ti, (positive, negative) in enumerate(clauses):
             pos = sorted({names[x] for x in positive})
             neg = sorted({names[x] for x in negative})
@@ -511,38 +632,17 @@ class CorrelationCompiler:
                 conditions.append(f"a.end <= (SELECT ts FROM {self.horizon})")
             ordered = kind == "temporal_ordered"
             sequence = anchors
-            slots = (
-                pos
-                if is_extended or partial_order
-                else list(range(len(rule.referenced_rules)))
-            )
-            times = []
+            slots = pos
             if ordered:
                 for si, slot in enumerate(slots):
-                    previous = (
-                        f"COALESCE({', '.join(reversed(times))})"
-                        if len(times) > 1
-                        else (times[0] if times else "NULL")
-                    )
-                    # Optional stages in a count condition may be absent. The
-                    # last non-NULL chosen time must still constrain later stages.
-                    after = (
-                        f" AND ({previous} IS NULL OR m.ts > {previous})"
-                        if times
-                        else ""
-                    )
+                    after = f" AND m.ts > a.q{si - 1}" if si else ""
                     t = f"q{si}"
                     sequence = self.add(
                         name + f"_seq{si}",
                         f"SELECT a.*, (SELECT MIN(m.ts) FROM {matches} m WHERE {predicate} "
                         f"AND m.slot={slot}{after}) AS {t} FROM {sequence} a",
                     )
-                    times.append(t)
-                    conditions.append(
-                        f"a.{t} IS NOT NULL"
-                        if is_extended
-                        else f"(NOT {presence(slot)} OR a.{t} IS NOT NULL)"
-                    )
+                    conditions.append(f"a.{t} IS NOT NULL")
             if kind.startswith("temporal"):
                 metric = f"(SELECT COUNT(DISTINCT m.slot) FROM {matches} m WHERE {predicate})"
             elif window_metrics:
@@ -551,8 +651,18 @@ class CorrelationCompiler:
                     f"{self.group_equal('m', 'a', count)}m.end=a.end)"
                 )
             elif kind == "value_count":
-                aggregate = "COUNT(DISTINCT m.v COLLATE NOCASE)"
-                metric = f"(SELECT {aggregate} FROM {events} m WHERE {predicate})"
+                collate = "NOCASE"
+                if len(value_columns) == 1:
+                    metric = f"(SELECT COUNT(DISTINCT m.v COLLATE {collate}) FROM {events} m WHERE {predicate})"
+                else:
+                    components = ", ".join(
+                        f"m.{v} COLLATE {collate}" for v in value_columns
+                    )
+                    complete = " AND ".join(f"m.{v} IS NOT NULL" for v in value_columns)
+                    metric = (
+                        f"(SELECT COUNT(*) FROM (SELECT DISTINCT {components} FROM {events} m "
+                        f"WHERE {predicate} AND {complete}))"
+                    )
             elif kind in ("value_median", "value_percentile"):
                 p = 50 if kind == "value_median" else rule.condition.percentile
                 if p is None or not 0 <= p <= 100:
@@ -580,11 +690,21 @@ class CorrelationCompiler:
                 f"SELECT a.*, {metric} AS metric FROM {sequence} a WHERE "
                 + (" AND ".join(conditions) or "1"),
             )
-            condition = (
-                "1"
-                if is_extended
-                else f"metric {self.backend.correlation_condition_mapping[rule.condition.op]} {rule.condition.count}"
-            )
+            condition = "1"
+            if not is_extended:
+                op = self.backend.correlation_condition_mapping[rule.condition.op]
+                threshold = rule.condition.count
+                condition = f"metric {op} {threshold}"
+                if (
+                    kind == "value_sum"
+                    and isinstance(threshold, int)
+                    and not -(2**63) <= threshold < 2**63
+                ):
+                    # SQL parses this literal as REAL, which can round onto
+                    # int64's lower boundary. Its order versus *any* int64
+                    # metric is known exactly at conversion time.
+                    comparison = 1 if threshold < 0 else -1
+                    condition = f"CASE WHEN typeof(metric)='integer' THEN {comparison} {op} 0 ELSE {condition} END"
             qualified = self.add(
                 name + "_qualified", f"SELECT * FROM {measured} WHERE {condition}"
             )
@@ -603,11 +723,11 @@ class CorrelationCompiler:
                 evidence_filter += " AND m.v IS NOT NULL"
             evidence = (
                 f"(SELECT json_group_array(DISTINCT e.value) FROM {matches} m, "
-                f"json_each(m.evidence) e WHERE {evidence_filter})"
+                f"{self.array_items}(m.evidence) e WHERE e.type='text' AND {evidence_filter})"
             )
             children = (
                 f"(SELECT json_group_array(DISTINCT c.value) FROM {matches} m, "
-                f"json_each(m.children) c WHERE {evidence_filter})"
+                f"{self.array_items}(m.children) c WHERE c.type='text' AND {evidence_filter})"
             )
             if forward and not pos:
                 evidence = (
@@ -641,6 +761,13 @@ class CorrelationCompiler:
             f"FROM json_each(w.{column}) a, json_each(a.value) e ORDER BY e.value)) AS {column}"
             for column in ("evidence", "children")
         ]
+        if self.array_items == "json_tree":
+            # Evidence and child IDs are the text leaves of these nested arrays.
+            merged = [
+                "(SELECT json_group_array(value) FROM (SELECT DISTINCT value "
+                f"FROM json_tree(w.{column}) WHERE type='text' ORDER BY value)) AS {column}"
+                for column in ("evidence", "children")
+            ]
         combined = self.add(
             stem + "_merged",
             f"SELECT {keys}, metric, {', '.join(merged)} FROM {grouped} w",

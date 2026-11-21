@@ -7,7 +7,7 @@ from collections import Counter
 
 from .cidr import CIDR_FUNCTION
 from .cidr import register_cidr as register_cidr
-from .correlation import BARE_NAME, FULLTEXT_REPRESENTATION, quote
+from .correlation import BARE_NAME, FULLTEXT_REPRESENTATION, json_array_function, quote
 
 _NAME = rf"(?:{BARE_NAME}|`(?:[^`]|``)+`)"
 _TABLE_NAME = re.compile(rf"{_NAME}(?:\.{_NAME})*\Z")
@@ -164,6 +164,7 @@ def execute_plan(
                     table_id, event_id = identity.split(":", 1)
                     ids_by_table.setdefault(table_id, set()).add(event_id)
             event_field = quote(plan["event_id_field"])
+            array_items = json_array_function(plan["source_tables"].values())
             for table_id, ids in ids_by_table.items():
                 table = plan["source_tables"][table_id]
                 # The CAST keeps IDs comparable whatever the column's type, but
@@ -171,7 +172,7 @@ def execute_plan(
                 cursor = connection.execute(
                     f"SELECT CAST({event_field} AS TEXT), * FROM {table} "
                     f"WHERE CAST({event_field} AS TEXT) IN "
-                    "(SELECT value FROM json_each(?))",
+                    f"(SELECT value FROM {array_items}(?) WHERE type='text')",
                     (json.dumps(sorted(ids)),),
                 )
                 columns = [d[0] for d in cursor.description][1:]
