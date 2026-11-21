@@ -84,7 +84,8 @@ Regenerate an existing rule containing `stamp|week: 1` to pick up ISO week
 numbering. It now includes 1 January 2025. Select `week_mode="legacy"` to
 reproduce older SQL that assigns that date to week 0. Regenerated `windash`
 and bounded regex predicates can also change matches. For example,
-`message|re|startswith: ab` matches `ab123` and excludes `xxab123`.
+`message|re|startswith: ab` matches `ab123` and excludes `xxab123`. Select
+`modifier_mode="pysigma"` to reproduce the older `windash` and regex SQL.
 
 Structured callbacks may keep or drop individual queries. A callback that
 substitutes SQL should request plain output. Derived structured entries need
