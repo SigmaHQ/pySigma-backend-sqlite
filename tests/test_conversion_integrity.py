@@ -253,6 +253,23 @@ def test_numeric_comparison_rejects_nul_terminated_prefix():
         assert db.execute(entry["rule"][0]).fetchall() == [("11",)]
 
 
+def test_presence_table_override_errors_are_collectable_before_finalization():
+    backend = sqliteBackend(
+        pipeline(for_title("bad", type="set_state", key="table", val="main.bad.name")),
+        presence_field="keys",
+        collect_errors=True,
+    )
+    bad = detection("bad")
+    bad["detection"]["s"] = {"value|exists": True}
+    entries = json.loads(
+        backend.convert(
+            SigmaCollection.from_dicts([bad, detection("good")]), "zircolite"
+        )
+    )
+    assert [entry["title"] for entry in entries] == ["good"]
+    assert [rule.title for rule, error in backend.errors] == ["bad"]
+
+
 def test_direct_correlation_preserves_the_converted_predicates_source():
     rules = SigmaCollection.from_dicts(
         [

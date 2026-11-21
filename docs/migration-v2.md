@@ -77,3 +77,22 @@ The bundled pySigma 2.0.3 changes also affect existing portable output.
   longer lets that spelling through. All 20 SigmaHQ rules with IPv6 CIDR values change.
 - Rule metadata loses control characters, line breaks included, so a multi-line
   `description` becomes one line with nothing where each break was.
+
+## Sigma 2.1 conformance changes
+
+Regenerate an existing rule containing `stamp|week: 1` to pick up ISO week
+numbering. It now includes 1 January 2025. Select `week_mode="legacy"` to
+reproduce older SQL that assigns that date to week 0. Regenerated `windash`
+and bounded regex predicates can also change matches. For example,
+`message|re|startswith: ab` matches `ab123` and excludes `xxab123`.
+
+Structured callbacks may keep or drop individual queries. A callback that
+substitutes SQL should request plain output. Derived structured entries need
+the compiler's source fields and matching execution plan.
+
+With default options, existing consumers receive schema versions 2–4.
+Enabling Unicode matching, per-row presence, or exact aggregation can produce
+schema 5. Upgrade the executor before distributing those entries. Existing
+flattened event stores need a new presence column populated from their source
+records before they can distinguish missing and explicitly null fields.
+[Consumer contract](output-format.md) · [Support and examples](sigma-conformance.md)

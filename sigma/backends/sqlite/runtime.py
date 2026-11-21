@@ -8,9 +8,11 @@ from collections import Counter
 from .cidr import CIDR_FUNCTION
 from .cidr import register_cidr as register_cidr
 from .correlation import BARE_NAME, FULLTEXT_REPRESENTATION, json_array_function, quote
+from .strict import PRESENCE_REPRESENTATION
+from .strict import register_sqlite_functions as register_sqlite_functions
 
 _NAME = rf"(?:{BARE_NAME}|`(?:[^`]|``)+`)"
-_TABLE_NAME = re.compile(rf"{_NAME}(?:\.{_NAME})*\Z")
+_TABLE_NAME = re.compile(rf"{_NAME}(?:\.{_NAME})?\Z")
 
 
 def _columns(connection, table):
@@ -21,23 +23,43 @@ def _columns(connection, table):
     return columns
 
 
-def validate_sql_functions(connection, requirements):
-    """Check the version-4 function contract on the connection that will run the SQL."""
-    if requirements != [CIDR_FUNCTION]:
-        raise ValueError(f"Unsupported required SQL functions: {requirements!r}")
-    try:
-        result = connection.execute(
-            f"SELECT {CIDR_FUNCTION}('::1', '::1/128') = 1 "
-            f"AND {CIDR_FUNCTION}('::2', '::1/128') = 0"
-        ).fetchone()
-    except sqlite3.Error as error:
-        raise ValueError(
-            f"Required SQL function {CIDR_FUNCTION} unavailable; call register_cidr(connection)"
-        ) from error
-    if result[0] != 1:
-        raise ValueError(
-            f"Required SQL function {CIDR_FUNCTION} failed its membership check"
+# Probe semantics and arity on the actual execution connection. The window check
+# also catches connections that registered an ordinary aggregate of the same name.
+_FUNCTION_CHECKS = {
+    CIDR_FUNCTION: f"{CIDR_FUNCTION}('::1','::1/128') = 1 AND {CIDR_FUNCTION}('::2','::1/128') = 0",
+    "regexp": "regexp('^a','ab') = 1 AND regexp('^a','ba') = 0 AND regexp('a',NULL) = 0",
+    "sigma_casefold": "sigma_casefold('Straße') = 'strasse' AND sigma_casefold(7) IS 7",
+    "sigma_unicode_like": "sigma_unicode_like('ß','ss') = 1 AND sigma_unicode_like('ß','_') = 1 AND sigma_unicode_like('ß','__') = 0",
+    "sigma_exact_sum": "(SELECT v FROM (SELECT sigma_exact_sum(n) OVER (ORDER BY n) AS v FROM (SELECT 9223372036854775807 AS n UNION ALL SELECT 1)) ORDER BY v DESC LIMIT 1) = '9223372036854775808'",
+    "sigma_numeric_cmp": "sigma_numeric_cmp('9223372036854775808',9223372036854775807) = 1 AND sigma_numeric_cmp('-10','-2') = -1",
+}
+
+
+def validate_sql_functions(connection, requirements, *, version=5):
+    """Check the functions declared by a structured entry or plan."""
+    if (
+        not isinstance(requirements, list)
+        or not requirements
+        or any(
+            not isinstance(f, str) or f not in _FUNCTION_CHECKS for f in requirements
         )
+        or len(set(requirements)) != len(requirements)
+        or version not in (4, 5)
+        or (version == 4 and requirements != [CIDR_FUNCTION])
+    ):
+        raise ValueError(f"Unsupported required SQL functions: {requirements!r}")
+    for name in requirements:
+        try:
+            result = connection.execute("SELECT " + _FUNCTION_CHECKS[name]).fetchone()
+        except sqlite3.Error as error:
+            registration = (
+                "register_cidr" if version == 4 else "register_sqlite_functions"
+            )
+            raise ValueError(
+                f"Required SQL function {name} unavailable; call {registration}(connection)"
+            ) from error
+        if result[0] != 1:
+            raise ValueError(f"Required SQL function {name} failed its semantics check")
 
 
 def validate_fulltext(connection, requirements):
@@ -77,6 +99,77 @@ def validate_fulltext(connection, requirements):
             )
 
 
+def validate_presence(connection, requirements):
+    """Check every source row carries a JSON array of mapped field names before widening."""
+    if not isinstance(requirements, list) or not requirements:
+        raise ValueError("Invalid presence requirements")
+    for item in requirements:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"table", "field", "representation"}
+            or not isinstance(item["table"], str)
+            or not _TABLE_NAME.fullmatch(item["table"])
+            or not isinstance(item["field"], str)
+            or not item["field"]
+            or "\x00" in item["field"]
+            or item["representation"] != PRESENCE_REPRESENTATION
+        ):
+            raise ValueError("Invalid presence requirement")
+        table, field = item["table"], item["field"]
+        try:
+            if field.lower() not in _columns(connection, table):
+                raise ValueError(
+                    f"Missing presence column {table}.{field}; re-ingest events"
+                )
+            cursor = connection.execute(f"SELECT {quote(field)} FROM {table}")
+            try:
+                for (source,) in cursor:
+                    if not isinstance(source, str):
+                        raise ValueError("expected TEXT")
+                    keys = json.loads(source)
+                    if not isinstance(keys, list) or any(
+                        not isinstance(key, str) or not key or "\x00" in key
+                        for key in keys
+                    ):
+                        raise ValueError("expected an array of nonempty field names")
+            finally:
+                cursor.close()
+        except (sqlite3.Error, ValueError, RecursionError) as error:
+            raise ValueError(
+                f"Invalid presence column {table}.{field}; re-ingest events: {error}"
+            ) from error
+
+
+def _validate_contract(connection, contract, version, fulltext_preflight=None):
+    if version not in (2, 3, 4, 5):
+        raise ValueError(f"Unsupported SQLite schema or plan version {version!r}")
+    if version == 4 or "required_sql_functions" in contract:
+        validate_sql_functions(
+            connection, contract.get("required_sql_functions"), version=version
+        )
+    if version == 5 and not (
+        contract.get("presence") or contract.get("required_sql_functions")
+    ):
+        raise ValueError("Version 5 requires a presence or SQL function declaration")
+    if "presence" in contract:
+        if version != 5:
+            raise ValueError("Field presence requires version 5")
+        validate_presence(connection, contract["presence"])
+    if version == 3 or "fulltext" in contract:
+        if version == 2:
+            raise ValueError("Fulltext requires version 3 or newer")
+        requirements = contract.get("fulltext")
+        if fulltext_preflight is None:
+            validate_fulltext(connection, requirements)
+        else:
+            fulltext_preflight(requirements)
+
+
+def validate_entry(connection, entry):
+    """Validate structured entry prerequisites before widening fields or running its SQL."""
+    _validate_contract(connection, entry, entry.get("schema_version"))
+
+
 def ensure_fields(connection, requirements):
     """Materialize absent event fields as NULL, using compiler metadata."""
     for table, fields in requirements.items():
@@ -100,7 +193,7 @@ def execute_plan(
     A caller may supply a cache-aware fulltext_preflight(requirements) hook;
     without one, plans requiring fulltext validate on every execution.
     """
-    if plan.get("version") not in (2, 3, 4):
+    if plan.get("version") not in (2, 3, 4, 5):
         raise ValueError("Unsupported correlation plan version")
     if limit is not None and limit < 0:
         raise ValueError("limit must be nonnegative")
@@ -108,16 +201,7 @@ def execute_plan(
         raise RuntimeError(
             "Correlation plans require SQLite >= 3.38 with JSON functions"
         )
-    if plan["version"] == 4:
-        validate_sql_functions(connection, plan.get("required_sql_functions"))
-    elif "required_sql_functions" in plan:
-        raise ValueError("Required SQL functions must be declared in a version-4 plan")
-    if plan["version"] == 3 or (plan["version"] == 4 and "fulltext" in plan):
-        requirements = plan.get("fulltext")
-        if fulltext_preflight is None:
-            validate_fulltext(connection, requirements)
-        else:
-            fulltext_preflight(requirements)
+    _validate_contract(connection, plan, plan["version"], fulltext_preflight)
     created = []
     try:
         for table in plan["source_tables"].values():
@@ -154,9 +238,11 @@ def execute_plan(
             for field in ("group_keys", "event_ids", "child_alert_ids"):
                 row[field] = json.loads(row[field])
         if include_events:
-            internal_fields = {
-                item["field"].lower() for item in plan.get("fulltext", [])
-            }
+            internal_fields = {}
+            for item in plan.get("fulltext", []) + plan.get("presence", []):
+                internal_fields.setdefault(item["table"], set()).add(
+                    item["field"].lower()
+                )
             evidence = {}
             ids_by_table = {}
             for row in rows:
@@ -184,7 +270,8 @@ def execute_plan(
                         "event": {
                             k: v
                             for k, v in zip(columns, event[1:])
-                            if v is not None and k.lower() not in internal_fields
+                            if v is not None
+                            and k.lower() not in internal_fields.get(table, ())
                         },
                     }
                 cursor.close()

@@ -28,8 +28,6 @@ from sigma.exceptions import (
     SigmaTimespanError,
 )
 
-from .cidr import required_sql_functions
-
 
 def literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
@@ -83,14 +81,22 @@ def json_object(pairs: list[tuple[str, str]]) -> str:
     return result
 
 
-def numeric(expression: str) -> str:
+def numeric(expression: str, *, wide_integers: bool = False) -> str:
     """Accept finite SQLite numbers and JSON-number strings, never CAST junk to 0."""
     number = f"json_extract(trim({expression}), '$')"
+    # JSON integer tokens beyond int64 extract as REAL. Pass their original
+    # spelling to the exact aggregate, including totals from child alerts.
+    wide = (
+        f"WHEN json_type(trim({expression}))='integer' AND typeof({number})='real' "
+        f"THEN trim({expression}) "
+        if wide_integers
+        else ""
+    )
     return (
         f"CASE WHEN typeof({expression}) = 'integer' THEN {expression} "
         f"WHEN typeof({expression}) = 'real' AND abs({expression}) < {SQL_INFINITY} THEN {expression} "
         f"WHEN typeof({expression}) = 'text' AND instr({expression},char(0))=0 "
-        f"THEN CASE WHEN json_valid(trim({expression})) THEN CASE "
+        f"THEN CASE WHEN json_valid(trim({expression})) THEN CASE {wide}"
         f"WHEN json_type(trim({expression})) IN ('integer', 'real') "
         f"AND abs(CAST({expression} AS REAL)) < {SQL_INFINITY} THEN {number} END END END"
     )
@@ -170,6 +176,7 @@ class CorrelationCompiler:
         self.backend = backend
         self.root = root
         self.stages: list[Stage] = []
+        self.stage_functions: set[str] = set()
         self.nodes = {}
         self.active = set()
         self.records = {}
@@ -369,6 +376,9 @@ class CorrelationCompiler:
         )
 
     def group_key(self, expression):
+        if self.backend.text_mode == "unicode":
+            self.stage_functions.add("sigma_casefold")
+            return f"sigma_casefold({expression})"
         return f"CASE WHEN typeof({expression})='text' THEN lower({expression}) ELSE {expression} END"
 
     def contexts(self, rule, fields):
@@ -490,6 +500,7 @@ class CorrelationCompiler:
         comma_groups = "".join(f", {g}" for g in gs)
         fields = metric_fields(rule)
         value_columns = ["v"] + [f"v{i}" for i in range(1, len(fields))]
+        exact_sum = kind == "value_sum" and self.backend.sum_mode == "exact"
         is_extended = isinstance(rule.condition, SigmaExtendedCorrelationCondition)
         ordered_threshold = kind == "temporal_ordered" and not is_extended
         branches = []
@@ -505,7 +516,9 @@ class CorrelationCompiler:
             ]
             values = [self._field("s.payload", mapping.get(f, f)) for f in fields]
             if kind in NUMERIC_KINDS:
-                values = [numeric(values[0])]
+                values = [numeric(values[0], wide_integers=exact_sum)]
+            if kind == "value_count" and self.backend.text_mode == "unicode":
+                values = [self.group_key(v) for v in values]
             columns = "".join(f", {expr} AS g{i}" for i, expr in enumerate(groups))
             columns += "".join(
                 f", {v} AS {col}" for v, col in zip(values or ["NULL"], value_columns)
@@ -569,11 +582,16 @@ class CorrelationCompiler:
                     stem + "_unique_events",
                     f"SELECT DISTINCT eid, ts{comma_groups} FROM {events}",
                 )
-            if kind == "value_sum":
+            if kind == "value_sum" and not exact_sum:
                 window_metrics = self.portable_sum(stem, events, gs, partition, frame)
             else:
+                if exact_sum:
+                    self.stage_functions.update(
+                        ("sigma_exact_sum", "sigma_numeric_cmp")
+                    )
                 aggregate = {
                     "event_count": "COUNT(*)",
+                    "value_sum": "sigma_exact_sum(v)",
                     "value_avg": "AVG(v)",
                 }[kind]
                 window_metrics = self.add(
@@ -651,7 +669,7 @@ class CorrelationCompiler:
                     f"{self.group_equal('m', 'a', count)}m.end=a.end)"
                 )
             elif kind == "value_count":
-                collate = "NOCASE"
+                collate = "BINARY" if self.backend.text_mode == "unicode" else "NOCASE"
                 if len(value_columns) == 1:
                     metric = f"(SELECT COUNT(DISTINCT m.v COLLATE {collate}) FROM {events} m WHERE {predicate})"
                 else:
@@ -695,7 +713,11 @@ class CorrelationCompiler:
                 op = self.backend.correlation_condition_mapping[rule.condition.op]
                 threshold = rule.condition.count
                 condition = f"metric {op} {threshold}"
-                if (
+                if exact_sum:
+                    condition = (
+                        f"sigma_numeric_cmp(metric, {literal(str(threshold))}) {op} 0"
+                    )
+                elif (
                     kind == "value_sum"
                     and isinstance(threshold, int)
                     and not -(2**63) <= threshold < 2**63
@@ -808,7 +830,6 @@ class CorrelationCompiler:
         ctes = ", ".join(f"{s.name} AS ({s.select})" for s in self.stages)
         diagnostics = " UNION ALL ".join(self.diagnostic_queries)
         plan = {
-            "version": 3 if self.fulltext_requirements else 2,
             "sqlite_min_version": "3.38.0",
             "prepare": [asdict(s) for s in self.stages],
             "query": query,
@@ -822,10 +843,11 @@ class CorrelationCompiler:
         }
         if self.fulltext_requirements:
             plan["fulltext"] = self.fulltext_requirements
-        functions = required_sql_functions(
-            state for states in self.records.values() for state in states
+        plan.update(
+            self.backend.execution_contract(
+                (state for states in self.records.values() for state in states),
+                fulltext=bool(self.fulltext_requirements),
+                extra_functions=self.stage_functions,
+            )
         )
-        if functions:
-            plan["required_sql_functions"] = functions
-            plan["version"] = 4
         return "WITH " + ctes + " " + query, plan

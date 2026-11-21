@@ -477,7 +477,25 @@ def test_ordered_partial_branches_include_only_participating_child_alerts(materi
     assert len(rows[-1]["child_alert_ids"]) == 1
 
 
-@pytest.mark.parametrize("sum_mode", ["portable"])
+@pytest.mark.parametrize("materialized", [False, True])
+def test_unicode_tuple_and_groups_fold_source_text(materialized):
+    docs = [
+        detection(),
+        correlation(
+            "value_count", condition={"gte": 1, "field": ["User", "OtherUser"]}
+        ),
+    ]
+    events = [
+        event(0, Host="CAFÉ", User="Straße", OtherUser="É"),
+        event(0, Host="café", User="STRASSE", OtherUser="é"),
+    ]
+    rows = execute(docs, events, materialized=materialized, text_mode="unicode")
+    assert [(r["group_keys"], r["metric_value"], r["event_ids"]) for r in rows] == [
+        ({"Host": "café"}, 1, ["0:1", "0:2"])
+    ]
+
+
+@pytest.mark.parametrize("sum_mode", ["portable", "exact"])
 @pytest.mark.parametrize("materialized", [False, True])
 def test_integer_sum_survives_overflow_elsewhere_and_window_eviction(
     sum_mode, materialized
@@ -512,6 +530,30 @@ def test_integer_sum_survives_overflow_elsewhere_and_window_eviction(
         float,
         int,
     ]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_exact_wide_totals_compare_and_chain_as_integers(materialized, sign):
+    wide = sign * (2**63 + 1)
+    child = correlation(
+        "value_sum", condition={"field": "Bytes", "eq": wide}, name="wide"
+    )
+    parent = correlation("value_sum", ("wide",), {"field": "sigma_metric", "eq": wide})
+    docs = [detection(), child, parent]
+    events = [
+        event(0, Bytes=str(wide)),
+        event(10, Bytes=sign * (2**63 - 1)),
+        event(10, Bytes=sign * 2),
+    ]
+    rows = execute(docs, events, materialized=materialized, sum_mode="exact")
+    assert [(r["metric_value"], r["event_ids"]) for r in rows] == [
+        (str(wide), ["0:1"]),
+        (str(wide), ["0:2", "0:3"]),
+    ]
+    assert all(len(r["child_alert_ids"]) == 1 for r in rows)
+    docs[-1]["correlation"]["condition"]["eq"] = wide + sign
+    assert not execute(docs, events, materialized=materialized, sum_mode="exact")
 
 
 @pytest.mark.parametrize(

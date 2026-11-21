@@ -78,6 +78,10 @@ option produces a warning so you can check which setting took effect.
 | `table` | `logs` | Table to query. A pipeline `setState` on `table` takes precedence |
 | `collate_nocase` | `false` | Emit `field='value' COLLATE NOCASE` for tables without `NOCASE` columns |
 | `prefilter_bounds` | `true` | Emit Channel/EventID allow-lists for Zircolite storage. Set to `false` for custom collations or event ID coercions |
+| `text_mode` | `portable` | Use `unicode` for Unicode case folding in detections, grouping and distinct counts |
+| `presence_field` | none | JSON array column listing the flattened fields present in each source event |
+| `sum_mode` | `portable` | Use `exact` to preserve integer window totals beyond SQLite's signed 64-bit range |
+| `week_mode` | `iso` | ISO week of year (1–53). Use `legacy` for SQLite's Monday-based week 0–53 |
 | `max_flat_operands` | `100` | Longer AND/OR chains are nested to stay under SQLite's expression depth limit |
 | `cidr_mode` | `expanded` | Use portable prefix matching or opt into exact network membership with `exact` |
 | `fulltext_field` | none | Column of searchable event text; enables [keyword search](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/keyword-search.md) |
@@ -86,6 +90,10 @@ option produces a warning so you can check which setting took effect.
 | `timestamp_seconds_expression` | ISO parser | SQL turning `{field}` into Unix seconds; overrides `timestamp_format` |
 | `event_id_field` | `rowid` | Non-NULL, per-table unique event identifier for correlation evidence |
 | `observation_end` | latest event | Unix seconds up to which absence windows can expire |
+
+The optional Unicode, presence and exact-sum contracts require a consumer that
+understands schema 5. The table below describes the portable settings.
+[Sigma 2.1 feature support and parser compatibility](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/sigma-conformance.md)
 
 ## Generated SQL
 
@@ -100,8 +108,8 @@ option produces a warning so you can check which setting took effect.
 | `exists` | `IS NOT NULL` / `IS NULL` |
 | `gt`, `gte`, `lt`, `lte` | Compare finite numbers and numeric text numerically |
 | `neq` | Negated equality |
-| `minute`, `hour`, `day`, `week`, `month`, `year` | `strftime()` part |
-| `base64`, `base64offset`, `wide`, `utf16*`, `windash` | Expanded by pySigma into ordinary matches |
+| `minute`, `hour`, `day`, `week`, `month`, `year` | Calendar part of an ISO-8601 timestamp |
+| `base64`, `base64offset`, `wide`, `utf16be`, `utf16`, `windash` | Expanded into text predicates. Follow byte encodings with a Base64 modifier |
 
 Generated SQL handles the following cases.
 
@@ -177,11 +185,11 @@ searchable text. See [keyword search](https://github.com/wagga40/pySigma-backend
   backreferences. For trusted rules, pass `policy=TrustedPolicy` (from
   `sigma.policy.profiles`) to `SigmaCollection.from_yaml()`; the patterns must then
   suit Python's `re`.
-- **Case folding** (`NOCASE`, `LIKE`) is ASCII only.
+- **Case folding.** Stock BINARY columns compare literal text case-sensitively. SQLite NOCASE columns or `collate_nocase=True` cover ASCII. Set `text_mode="unicode"` and register the runtime helpers for Unicode equality, wildcards, field comparisons and keywords.
 - **Timestamp parts** use `strftime()` and need ISO-8601 text; a numeric epoch is
-  read as a Julian day. `%W` can return week 0.
-- **Field existence.** SQL `NULL` cannot tell a missing field from an explicit null.
-- **Multi-field `value_count`** (a list in `condition.field`) is rejected.
+  read as a Julian day. ISO week 53 occurs in some years. Only `week_mode="legacy"` can produce week 0.
+- **Field existence.** With `presence_field`, `exists` includes an explicitly null field. The default uses SQL NULL as a proxy for absence.
+- **Multi-field `value_count`** counts distinct complete tuples in each window. A NULL component excludes that tuple from the count.
 - **Unknown columns.** A query naming a column the table lacks fails to prepare.
   Add missing columns as `NULL` first; see [output format](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/output-format.md).
 
