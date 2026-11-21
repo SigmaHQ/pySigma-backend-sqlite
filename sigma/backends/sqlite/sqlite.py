@@ -222,6 +222,7 @@ class sqliteBackend(TextQueryBackend):
     # NOCASE column is noise, and because forcing a collation can cost an index seek.
     # Comparisons emitted as LIKE are case-insensitive either way; |cased uses GLOB, which is
     # case-sensitive by definition and is never collated.
+    prefilter_bounds: bool = True
     collate_nocase: bool = False
     collation_expression: ClassVar[str] = "{expr} COLLATE NOCASE"
 
@@ -264,6 +265,7 @@ class sqliteBackend(TextQueryBackend):
             "timestamp_format",
             "week_mode",
             "collate_nocase",
+            "prefilter_bounds",
             "max_flat_operands",
             "fulltext_field",
             "cidr_mode",
@@ -278,10 +280,12 @@ class sqliteBackend(TextQueryBackend):
                 )
         for key in configurable & options.keys():
             value = options[key]
-            if key == "collate_nocase" and isinstance(value, str):
+            if key in ("collate_nocase", "prefilter_bounds") and isinstance(value, str):
                 if value.lower() not in ("true", "false"):
-                    raise ValueError("collate_nocase must be true or false")
+                    raise ValueError(f"{key} must be true or false")
                 value = value.lower() == "true"
+            if key == "prefilter_bounds" and not isinstance(value, bool):
+                raise ValueError("prefilter_bounds must be true or false")
             if key == "max_flat_operands":
                 value = int(value)
                 if value < 2:
@@ -915,6 +919,8 @@ class sqliteBackend(TextQueryBackend):
 
         An empty list means "no provable bound" and leaves the field unfiltered downstream.
         """
+        if not self.prefilter_bounds:
+            return []
         condition = rule.detection.parsed_condition[index].parsed
         bound = self._field_value_bound(condition, field_name.lower())
         return sorted(bound, key=str) if bound else []

@@ -29,6 +29,12 @@ An exact IPv4 `/32` uses built-in SQL and adds no function prerequisite.
 A conversion callback for structured output may return the original query or
 `None` to drop it. Request plain SQL output for callbacks that replace SQL.
 
+Channel and EventID allow-lists assume the Zircolite event model, with
+case-insensitive channel comparison and integer event identifiers. Set
+`prefilter_bounds=False` when the comparison contract is unknown, for example
+when a custom SQLite collation equates `System` with `System `. The resulting
+empty lists preserve every candidate for SQL evaluation.
+
 Load related rule files into one collection: correlations resolve the rules they
 reference by name. For events from several files, use one database;
 correlations cannot span separate databases.

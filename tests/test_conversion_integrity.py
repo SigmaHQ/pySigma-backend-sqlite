@@ -353,3 +353,27 @@ def test_direct_retry_uses_the_current_pipeline():
         backend.convert_correlation_rule(child)
     backend.processing_pipeline = None
     assert len(backend.convert_correlation_rule(child)) == 1
+
+
+def test_custom_storage_can_disable_prefilter_bounds():
+    rule = detection()
+    rule["detection"]["s"] = {"Channel": "System", "EventID": 1}
+
+    def compile_entry(**options):
+        return json.loads(
+            sqliteBackend(**options).convert(
+                SigmaCollection.from_dicts([rule]), "zircolite"
+            )
+        )[0]
+
+    standard = compile_entry()
+    entry = compile_entry(prefilter_bounds="false")
+    assert (standard["channel"], standard["eventid"]) == (["System"], [1])
+    assert (entry["channel"], entry["eventid"]) == ([], [])
+    assert standard["rule"] == entry["rule"]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(Channel TEXT COLLATE RTRIM, EventID INTEGER)")
+        db.execute("INSERT INTO logs VALUES('System ',1)")
+        assert db.execute(entry["rule"][0]).fetchall() == [("System ", 1)]
+    with pytest.raises(ValueError, match="prefilter_bounds"):
+        sqliteBackend(prefilter_bounds=[])

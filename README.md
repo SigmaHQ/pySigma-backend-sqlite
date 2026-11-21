@@ -77,6 +77,7 @@ option produces a warning so you can check which setting took effect.
 |---|---|---|
 | `table` | `logs` | Table to query. A pipeline `setState` on `table` takes precedence |
 | `collate_nocase` | `false` | Emit `field='value' COLLATE NOCASE` for tables without `NOCASE` columns |
+| `prefilter_bounds` | `true` | Emit Channel/EventID allow-lists for Zircolite storage. Set to `false` for custom collations or event ID coercions |
 | `max_flat_operands` | `100` | Longer AND/OR chains are nested to stay under SQLite's expression depth limit |
 | `cidr_mode` | `expanded` | Use portable prefix matching or opt into exact network membership with `exact` |
 | `fulltext_field` | none | Column of searchable event text; enables [keyword search](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/keyword-search.md) |
