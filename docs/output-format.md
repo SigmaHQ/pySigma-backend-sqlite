@@ -26,6 +26,9 @@ the fields, keyword text and SQL functions its condition uses. A correlation
 plan collects requirements across the referenced predicates it evaluates.
 An exact IPv4 `/32` uses built-in SQL and adds no function prerequisite.
 
+A conversion callback for structured output may return the original query or
+`None` to drop it. Request plain SQL output for callbacks that replace SQL.
+
 Load related rule files into one collection: correlations resolve the rules they
 reference by name. For events from several files, use one database;
 correlations cannot span separate databases.

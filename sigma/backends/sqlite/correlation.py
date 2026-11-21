@@ -117,6 +117,18 @@ def terms(node, negative=False):
     return result
 
 
+class ReferenceConversionError(SigmaCorrelationRuleError):
+    """Preserve the originating failed dependency across a chain of correlations."""
+
+    def __init__(self, parent, dependency, reason):
+        self.dependency = dependency
+        self.reason = reason
+        super().__init__(
+            f"Correlation {parent.title!r} references {dependency!r}, which {reason}",
+            source=parent.source,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Stage:
     name: str
@@ -127,14 +139,14 @@ class Stage:
 class CorrelationCompiler:
     """Compile an already processed, resolved correlation dependency graph."""
 
-    def __init__(self, backend, root):
+    def __init__(self, backend, root, structured=False):
+        self.structured = structured
         self.backend = backend
         self.root = root
         self.stages: list[Stage] = []
         self.nodes = {}
         self.active = set()
-        self.base_rules = {}
-        self.predicates = {}
+        self.records = {}
         self.fields = set()
         self.required_by_table: dict[str, set[str]] = {}
         self.source_tables = {}
@@ -142,8 +154,9 @@ class CorrelationCompiler:
         self._discover(root)
         fulltext = {
             (item["table"], item["field"]): item
-            for rule in self.base_rules.values()
-            for item in self.backend.fulltext_requirements(rule)
+            for states in self.records.values()
+            for state in states
+            for item in state.sqlite_predicate.fulltext
         }
         self.fulltext_requirements = [fulltext[key] for key in sorted(fulltext)]
         self.field_ids = {f: f"f{i}" for i, f in enumerate(sorted(self.fields))}
@@ -158,6 +171,19 @@ class CorrelationCompiler:
         return name
 
     def _discover(self, rule):
+        if rule is not self.root:
+            failure = getattr(rule, "_sqlite_dependency_failure", None)
+            if failure is not None:
+                raise ReferenceConversionError(self.root, *failure)
+            if self.structured and isinstance(rule, SigmaCorrelationRule):
+                try:
+                    states = rule.get_conversion_states()
+                except SigmaConversionError:
+                    states = []
+                if any(getattr(state, "sqlite_replaced", False) for state in states):
+                    raise ReferenceConversionError(
+                        self.root, rule.title, "has callback-replaced SQL"
+                    )
         if id(rule) in self.active:
             raise SigmaCorrelationRuleError(
                 f"Correlation {rule.title!r} has cyclic references", source=rule.source
@@ -177,32 +203,31 @@ class CorrelationCompiler:
                 self.fields.update(alias.mapping.values())
             for ref in rule.referenced_rules:
                 self._discover(ref.rule)
-        elif id(rule) not in self.base_rules:
-            self.predicates[id(rule)] = self._compiled_predicate(rule)
-            self.base_rules[id(rule)] = rule
+        elif id(rule) not in self.records:
+            self.records[id(rule)] = self._compiled_records(rule)
         self.active.remove(id(rule))
 
-    def _compiled_predicate(self, rule):
-        # A collected detection error leaves pySigma's result and states unset.
-        # Check both before reading the states for table and full-text metadata.
+    def _compiled_records(self, rule):
         try:
-            queries = rule.get_conversion_result()
             states = rule.get_conversion_states()
         except SigmaConversionError:
-            pass
-        else:
-            if (
-                states
-                and isinstance(queries, list)
-                and queries
-                and all(isinstance(q, str) and q.strip() for q in queries)
-            ):
-                return self.backend._join_operands([f"({q})" for q in queries], " OR ")
-        raise SigmaCorrelationRuleError(
-            f"Correlation {self.root.title!r} references {rule.title!r}, "
-            "which has no compiled predicates",
-            source=self.root.source,
-        )
+            states = []
+        records = [state for state in states if hasattr(state, "sqlite_predicate")]
+        if not records or not all(
+            isinstance(state.sqlite_predicate.sql, str)
+            and state.sqlite_predicate.sql.strip()
+            for state in records
+        ):
+            raise ReferenceConversionError(
+                self.root, rule.title, "has no compiled predicates"
+            )
+        if self.structured and any(
+            state.sqlite_predicate.replaced for state in records
+        ):
+            raise ReferenceConversionError(
+                self.root, rule.title, "has callback-replaced SQL"
+            )
+        return records
 
     @staticmethod
     def _alias_mapping(rule, ref):
@@ -218,21 +243,16 @@ class CorrelationCompiler:
     def _field(self, payload, field):
         return f"json_extract({payload}, '$.{self.field_ids[field]}')"
 
-    def _table(self, rule):
-        states = rule.get_conversion_states()
-        state = states[0].processing_state if states else {}
-        return self.backend.resolve_table(state)
-
     def _physical_fields(self, rule, wanted):
         if not isinstance(rule, SigmaCorrelationRule):
-            table = self._table(rule)
-            self.required_by_table.setdefault(table, set()).update(wanted)
+            for state in self.records[id(rule)]:
+                table = state.sqlite_predicate.table
+                self.required_by_table.setdefault(table, set()).update(wanted)
             return
         own = set(rule.group_by or []) | {rule.type.name.lower(), "sigma_metric"}
         # Parent fields not in the child's summary are propagated from evidence.
         needed = (set(wanted) - own) | set(rule.group_by or [])
-        field = getattr(rule.condition, "fieldref", None)
-        if field:
+        if field := getattr(rule.condition, "fieldref", None):
             needed.add(field)
         for ref in rule.referenced_rules:
             mapping = self._alias_mapping(rule, ref)
@@ -241,14 +261,14 @@ class CorrelationCompiler:
     def _raw_sources(self):
         self._physical_fields(self.root, set())
         by_table = {}
-        for rule in self.base_rules.values():
-            table = self._table(rule)
-            by_table.setdefault(table, []).append(rule)
-            self.required_by_table.setdefault(table, set()).update(
-                self.backend.required_fields(rule)
-            )
-        for item in self.fulltext_requirements:
-            self.required_by_table.setdefault(item["table"], set()).add(item["field"])
+        for key, states in self.records.items():
+            for state in states:
+                predicate = state.sqlite_predicate
+                by_table.setdefault(predicate.table, {}).setdefault(key, []).append(
+                    f"({predicate.sql})"
+                )
+                self.required_by_table[predicate.table].update(predicate.fields)
+        self.raw_tables = []
         for i, (table, rules) in enumerate(by_table.items()):
             self.source_tables[str(i)] = table
             fields = self.required_by_table[table]
@@ -267,8 +287,8 @@ class CorrelationCompiler:
                 ]
             )
             flags = [
-                f"COALESCE(({self.predicates[id(rule)]}), 0) AS b{j}"
-                for j, rule in enumerate(rules)
+                f"COALESCE(({self.backend._join_operands(predicates, ' OR ')}), 0) AS b{j}"
+                for j, predicates in enumerate(rules.values())
             ]
             time = self.backend._correlation_timestamp()
             event_id = f"CAST({quote(self.backend.event_id_field)} AS TEXT)"
@@ -278,8 +298,9 @@ class CorrelationCompiler:
                 f"{time} AS ts, {payload} AS payload, {', '.join(flags)} FROM {table}",
                 [("eid",), ("ts",)],
             )
-            for j, rule in enumerate(rules):
-                self.raw[id(rule)] = (raw, f"b{j}", i)
+            self.raw_tables.append(raw)
+            for j, key in enumerate(rules):
+                self.raw.setdefault(key, []).append((raw, f"b{j}"))
             self.diagnostic_queries.append(
                 f"SELECT 'invalid_timestamp' AS reason, COUNT(*) AS count FROM {raw} "
                 f"WHERE ts IS NULL AND ({' OR '.join(f'b{j}' for j in range(len(rules)))})"
@@ -288,26 +309,28 @@ class CorrelationCompiler:
         if horizon is not None:
             expr = str(float(horizon))
         else:
-            sources = sorted({v[0] for v in self.raw.values()})
             expr = (
                 "(SELECT MAX(ts) FROM ("
-                + " UNION ALL ".join(f"SELECT ts FROM {source}" for source in sources)
+                + " UNION ALL ".join(
+                    f"SELECT ts FROM {source}" for source in self.raw_tables
+                )
                 + "))"
             )
         self.horizon = self.add("horizon", f"SELECT {expr} AS ts")
 
     def source(self, rule):
         if not isinstance(rule, SigmaCorrelationRule):
-            raw, flag, _ = self.raw[id(rule)]
-            return (
+            return " UNION ALL ".join(
                 f"SELECT 'e:' || eid AS eid, ts, payload, json_array(eid) AS evidence, "
                 f"'[]' AS children FROM {raw} WHERE {flag}"
+                for raw, flag in self.raw[id(rule)]
             )
         result = self.compile_node(rule)
         # Rehydrate fields the parent needs from the child's evidence; summary
         # fields override raw values. Parent event_count still counts child IDs.
-        raws = sorted({v[0] for v in self.raw.values()})
-        union = " UNION ALL ".join(f"SELECT eid, payload FROM {raw}" for raw in raws)
+        union = " UNION ALL ".join(
+            f"SELECT eid, payload FROM {raw}" for raw in self.raw_tables
+        )
         return (
             f"SELECT DISTINCT 'c:' || c.alert_id AS eid, c.end AS ts, "
             f"json_patch(r.payload, c.payload) AS payload, c.evidence, "
@@ -328,12 +351,13 @@ class CorrelationCompiler:
     def contexts(self, rule, fields):
         """Project observed context through the same aliases as rule membership."""
         if not isinstance(rule, SigmaCorrelationRule):
-            raw = self.raw[id(rule)][0]
             columns = "".join(
                 f", {group_key(self._field('payload', field))} AS g{i}"
                 for i, field in enumerate(fields)
             )
-            return [f"SELECT eid, ts{columns} FROM {raw}"]
+            return [
+                f"SELECT eid, ts{columns} FROM {raw}" for raw, _ in self.raw[id(rule)]
+            ]
         sources = []
         for ref in rule.referenced_rules:
             mapping = self._alias_mapping(rule, ref)
@@ -672,9 +696,7 @@ class CorrelationCompiler:
         if self.fulltext_requirements:
             plan["fulltext"] = self.fulltext_requirements
         functions = required_sql_functions(
-            state
-            for base in self.base_rules.values()
-            for state in base.get_conversion_states()
+            state for states in self.records.values() for state in states
         )
         if functions:
             plan["required_sql_functions"] = functions

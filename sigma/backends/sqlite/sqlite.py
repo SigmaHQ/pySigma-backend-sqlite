@@ -2,6 +2,7 @@ import json
 import math
 import re
 import warnings
+from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import Any, ClassVar
 
@@ -18,7 +19,12 @@ from sigma.correlations import (
     SigmaCorrelationConditionOperator,
     SigmaCorrelationRule,
 )
-from sigma.exceptions import SigmaError, SigmaFeatureNotSupportedByBackendError
+from sigma.exceptions import (
+    SigmaConfigurationError,
+    SigmaConversionError,
+    SigmaError,
+    SigmaFeatureNotSupportedByBackendError,
+)
 from sigma.rule import SigmaRule
 from sigma.types import (
     SigmaCasedString,
@@ -38,6 +44,7 @@ from .correlation import (
     FULLTEXT_REPRESENTATION,
     SQL_INFINITY,
     CorrelationCompiler,
+    ReferenceConversionError,
     literal,
     numeric,
     quote,
@@ -63,6 +70,18 @@ def _is_keyword(cond):
     return isinstance(cond, ConditionValueExpression) and isinstance(
         cond.value, _KEYWORD_VALUES
     )
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedPredicate:
+    """SQL and source requirements kept on its original pySigma conversion state."""
+
+    index: int
+    sql: str
+    table: str
+    fields: list[str]
+    fulltext: list[dict]
+    replaced: bool
 
 
 class sqliteBackend(TextQueryBackend):
@@ -145,7 +164,8 @@ class sqliteBackend(TextQueryBackend):
     # column affinity without changing the stored value. CAST AS NUMERIC keeps
     # representable integers exact, including those beyond double precision.
     compare_op_expression: ClassVar[str] = (
-        "(CASE WHEN +{field} = CAST({field} AS NUMERIC) AND "
+        "(CASE WHEN (typeof({field}) != 'text' OR instr({field}, char(0)) = 0) AND "
+        "+{field} = CAST({field} AS NUMERIC) AND "
         f"CAST({{field}} AS NUMERIC) > -{SQL_INFINITY} AND "
         f"CAST({{field}} AS NUMERIC) < {SQL_INFINITY} "
         "THEN CAST({field} AS NUMERIC) END) {operator} {value}"
@@ -297,12 +317,28 @@ class sqliteBackend(TextQueryBackend):
 
     def resolve_table(self, state=None):
         table = (state or {}).get("table")
-        return self._quoted_table(self.table if table is None else table)
+        if table is None:
+            return self._quoted_table(self.table)
+        try:
+            return self._quoted_table(table)
+        except ValueError as error:
+            raise SigmaConfigurationError(
+                f"Invalid pipeline table override: {error}"
+            ) from error
 
     def _quoted_table(self, table):
-        if not isinstance(table, str) or "\x00" in table or not all(table.split(".")):
-            raise ValueError("table must have nonempty name components without NUL")
-        return ".".join(self.escape_and_quote_field(part) for part in table.split("."))
+        if (
+            not isinstance(table, str)
+            or "\x00" in table
+            or table.count(".") > 1
+            or not all(table.split("."))
+        ):
+            raise ValueError(
+                "table must have one or two nonempty name components without NUL"
+            )
+        if "." in table:
+            return ".".join(quote(part) for part in table.split("."))
+        return self.escape_and_quote_field(table)
 
     def escape_and_quote_field(self, field):
         # SQLite keywords are identifiers only when quoted. This set includes
@@ -348,88 +384,140 @@ class sqliteBackend(TextQueryBackend):
             for table in sorted(tables)
         ]
 
+    def init_processing_pipeline(self, output_format=None):
+        super().init_processing_pipeline(output_format)
+        self._configured_pipeline = self.processing_pipeline
+
+    def _prepare_conversion(self, rule, output_format):
+        # Reset the previous attempt before a pipeline, callback or finalizer can fail.
+        rule.set_conversion_result([])
+        rule.set_conversion_states([])
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if (
+            pipeline is None
+            or self._configured_pipeline is not self.processing_pipeline
+            or pipeline.vars.get("output_format")
+            != (output_format or self.default_format)
+        ):
+            self.init_processing_pipeline(output_format)
+
+    def _callback_result(self, callback, rule, fmt, index, condition, predicate):
+        if callback is None:
+            return predicate
+        result = callback(rule, fmt, index, condition, predicate)
+        if (
+            (fmt or self.default_format) == "zircolite"
+            and result is not None
+            and result != predicate
+        ):
+            raise SigmaConversionError(
+                rule,
+                rule.source,
+                f"Structured output for {rule.title!r} requires callbacks to return "
+                "the original SQL or None so its execution requirements remain valid",
+            )
+        return result
+
     def convert_correlation_rule(
         self, rule, output_format=None, method=None, callback=None
     ):
-        if not hasattr(self, "last_processing_pipeline"):
-            self.init_processing_pipeline(output_format)
-        # pySigma collects errors for detection rules only.
+        self._prepare_conversion(rule, output_format)
+        # The dependency marker belongs to this attempt. An intermediate rule
+        # with generate disabled still has a successful conversion result.
+        rule._sqlite_dependency_failure = (rule.title, "failed to convert")
+        replaced = False
+
+        def select(rule, fmt, index, query, predicate):
+            nonlocal replaced
+            result = self._callback_result(callback, rule, fmt, index, query, predicate)
+            replaced = result is not None and result != predicate
+            return result
+
         try:
-            return super().convert_correlation_rule(
-                rule, output_format, method, callback
+            output = super().convert_correlation_rule(
+                rule, output_format, method, select
             )
-        except SigmaError as e:
-            if not self.collect_errors:
-                raise
-            self.errors.append((rule, e))
-            return []
-
-    def convert_rule(self, rule, output_format=None, callback=None):
-        if rule._backreferences:
-            # pySigma keeps the previous result if converting this rule fails.
-            # Dependents must only see predicates from the current conversion.
-            rule.set_conversion_result([])
-            rule.set_conversion_states([])
-        if callback is not None and output_format == "zircolite":
-            return self._convert_selected_entries(rule, callback)
-        queries = super().convert_rule(rule, output_format, callback)
-        # pySigma stores predicates for referenced rules. generate:true must
-        # still emit finalized standalone queries without overwriting them.
-        if (
-            rule._backreferences
-            and rule._output
-            and not self.finalize_correlation_subqueries
-        ):
-            return [
-                self.finalize_query(
-                    rule,
-                    query,
-                    i,
-                    rule.get_conversion_states()[i],
-                    output_format or self.default_format,
-                )
-                for i, query in enumerate(queries)
-            ]
-        return queries
-
-    def _convert_selected_entries(self, rule, callback):
-        # pySigma numbers finalized queries after removing skipped conditions.
-        # Keep their original indices so each entry uses its own conversion state.
-        selected = []
-
-        def select(rule, fmt, index, condition, predicate):
-            result = callback(rule, fmt, index, condition, predicate)
-            if result is not None:
-                selected.append((index, result))
-            # Defer finalization until pySigma has stored the conversion states.
-            return None
-
-        error_count = len(self.errors)
-        super().convert_rule(rule, "zircolite", select)
-        if not selected or len(self.errors) != error_count:
-            return []
-        states = rule.get_conversion_states()
-        raw = rule._backreferences and not self.finalize_correlation_subqueries
-        if raw:
-            rule.set_conversion_result([query for _, query in selected])
-            if not rule._output:
-                return []
-        try:
-            entries = [
-                self.finalize_query(rule, query, i, states[i], "zircolite")
-                for i, query in selected
-            ]
+            if rule.get_conversion_result():
+                del rule._sqlite_dependency_failure
+                rule.get_conversion_states()[0].sqlite_replaced = replaced
+            else:
+                rule._sqlite_dependency_failure = (rule.title, "has no compiled query")
+            return output
         except SigmaError as error:
+            if isinstance(error, ReferenceConversionError):
+                rule._sqlite_dependency_failure = (error.dependency, error.reason)
             if not self.collect_errors:
                 raise
             self.errors.append((rule, error))
             return []
-        if not raw:
-            rule.set_conversion_result(entries)
+        finally:
+            # A skipped query or exception may bypass both finalizers.
+            self._correlation_plans.pop(id(rule), None)
+
+    def convert_rule(self, rule, output_format=None, callback=None):
+        self._prepare_conversion(rule, output_format)
+        selected = []
+
+        def select(rule, fmt, index, condition, predicate):
+            result = self._callback_result(
+                callback, rule, fmt, index, condition, predicate
+            )
+            if result is not None:
+                selected.append((index, result, result != predicate))
+            # Let pySigma apply its pipeline and compile every condition once.
+            # Finalize after it exposes the states, using original indices.
+            return None
+
+        error_count = len(self.errors)
+        super().convert_rule(rule, output_format, select)
+        if len(self.errors) != error_count:
+            return []
+        states = rule.get_conversion_states()
+        raw = rule._backreferences and not self.finalize_correlation_subqueries
+        try:
+            self.resolve_table(self.last_processing_pipeline.state)
+            retained = []
+            for index, query, replaced in selected:
+                state = states[index]
+                state.sqlite_predicate = RetainedPredicate(
+                    index,
+                    query,
+                    self.resolve_table(state.processing_state),
+                    self.required_fields(rule, index),
+                    self.fulltext_requirements(rule, state.processing_state, index),
+                    replaced,
+                )
+                retained.append(state)
+            entries = []
+            if rule._output or not raw:
+                for state in retained:
+                    predicate = state.sqlite_predicate
+                    entries.append(
+                        self.finalize_query(
+                            rule,
+                            predicate.sql,
+                            predicate.index,
+                            state,
+                            output_format or self.default_format,
+                        )
+                    )
+        except Exception as error:
+            rule.set_conversion_states([])
+            if not (self.collect_errors and isinstance(error, SigmaError)):
+                raise
+            self.errors.append((rule, error))
+            return []
+        rule.set_conversion_result(
+            [state.sqlite_predicate.sql for state in retained] if raw else entries
+        )
         return entries if rule._output else []
 
     def convert_correlation_rule_from_template(self, rule, correlation_type, method):
-        query, plan = CorrelationCompiler(self, rule).compile()
+        self.resolve_table(self.last_processing_pipeline.state)
+        structured = (
+            self.last_processing_pipeline.vars.get("output_format") == "zircolite"
+        )
+        query, plan = CorrelationCompiler(self, rule, structured).compile()
         self._correlation_plans[id(rule)] = plan
         return [query]
 
@@ -732,12 +820,32 @@ class sqliteBackend(TextQueryBackend):
             if cond.field is None or cond.field.lower() != field_name_lower:
                 return None
             value = cond.value
-            if isinstance(value, SigmaNumber):
-                return {value.number}
-            # A wildcard, regex, CIDR, comparison, field reference or existence test names no
-            # single value the rule requires.
+            if type(value) is SigmaNumber:
+                if field_name_lower == "eventid" and isinstance(value.number, int):
+                    # Larger integers may compare equal after REAL affinity rounds them.
+                    if abs(value.number) < 2**53:
+                        return {value.number}
+                return None
             if isinstance(value, SigmaString) and not value.contains_special():
-                return {str(value)}
+                # to_plain() restores Sigma wildcard escapes. SQL compares their
+                # decoded characters, which are already present in the string segments.
+                text = value.convert(escape_char=None)
+                if field_name_lower == "eventid":
+                    # Decimal/exponent spellings depend on both column affinity
+                    # and consumer coercion. Another AND operand may still bound them.
+                    digits = text.lstrip("+-")
+                    if len(digits) <= 16 and re.fullmatch(r"[+-]?[0-9]+", text):
+                        number = int(text)
+                        if abs(number) < 2**53:
+                            return {number}
+                    return None
+                if re.fullmatch(
+                    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+                    text.strip(),
+                ):
+                    # NUMERIC affinity can match another spelling of this channel.
+                    return None
+                return {text}
             return None
 
         if isinstance(cond, ConditionAND):
@@ -800,15 +908,15 @@ class sqliteBackend(TextQueryBackend):
                 "result_type": "correlation",
             }
         else:
-            fulltext = self.fulltext_requirements(rule, state.processing_state, index)
+            fulltext = state.sqlite_predicate.fulltext
             sql_functions = required_sql_functions([state])
             # Channels and event IDs the rule's condition provably requires
             channels = self._extract_field_values_from_rule(rule, "Channel", index)
             event_ids = self._extract_field_values_from_rule(rule, "EventID", index)
             kind = {
-                "required_fields": self.required_fields(rule, index),
+                "required_fields": state.sqlite_predicate.fields,
                 "result_type": "event",
-                "source_table": self.resolve_table(state.processing_state),
+                "source_table": state.sqlite_predicate.table,
                 "logsource": {
                     key: getattr(rule.logsource, key)
                     for key in ("product", "category", "service")
