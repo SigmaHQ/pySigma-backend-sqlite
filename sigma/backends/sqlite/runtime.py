@@ -46,7 +46,8 @@ def _columns(connection, table):
 # also catches connections that registered an ordinary aggregate of the same name.
 _FUNCTION_CHECKS = {
     CIDR_FUNCTION: f"{CIDR_FUNCTION}('::1','::1/128') = 1 AND {CIDR_FUNCTION}('::2','::1/128') = 0",
-    "regexp": "regexp('^a','ab') = 1 AND regexp('^a','ba') = 0 AND regexp('a',NULL) = 0",
+    # Emitted predicates wrap REGEXP in COALESCE where NULL would change the result.
+    "regexp": "regexp('^a','ab') = 1 AND regexp('^a','ba') = 0 AND COALESCE(regexp('a',NULL), 0) = 0",
     "sigma_casefold": "sigma_casefold('Straße') = 'strasse' AND sigma_casefold(7) IS 7",
     "sigma_unicode_like": "sigma_unicode_like('ß','ss') = 1 AND sigma_unicode_like('ß','_') = 1 AND sigma_unicode_like('ß','__') = 0",
     "sigma_exact_sum": "(SELECT v FROM (SELECT sigma_exact_sum(n) OVER (ORDER BY n) AS v FROM (SELECT 9223372036854775807 AS n UNION ALL SELECT 1)) ORDER BY v DESC LIMIT 1) = '9223372036854775808'",
@@ -72,7 +73,9 @@ def validate_sql_functions(connection, requirements, *, version=5):
             result = connection.execute("SELECT " + _FUNCTION_CHECKS[name]).fetchone()
         except sqlite3.Error as error:
             registration = (
-                "register_cidr" if version == 4 else "register_sqlite_functions"
+                "register_cidr"
+                if requirements == [CIDR_FUNCTION]
+                else "register_sqlite_functions"
             )
             raise ValueError(
                 f"Required SQL function {name} unavailable; call {registration}(connection)"

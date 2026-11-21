@@ -401,8 +401,8 @@ class sqliteBackend(TextQueryBackend):
             return super().convert_condition_field_eq_val_exists(cond, state)
         table = self.resolve_table(state.processing_state)
         state.sqlite_presence_source = (table, field)
-        # Walk the validated array with scalar JSON extraction. Tables elsewhere
-        # on the connection may shadow either of SQLite's JSON virtual tables.
+        # Read the validated array with scalar functions. Tables elsewhere on the
+        # connection may shadow either of SQLite's JSON virtual tables.
         source = f"{table}.{quote(field)}"
         table_name = (
             (state.processing_state.get("table") or self.table)
@@ -411,35 +411,55 @@ class sqliteBackend(TextQueryBackend):
         )
         alias = "field_names" if table_name == "presence_keys" else "presence_keys"
         negation = "" if cond.value.exists else "NOT "
-        return (
-            f"{negation}EXISTS (WITH RECURSIVE {alias}(i, key) AS ("
+        walk = (
+            f"EXISTS (WITH RECURSIVE {alias}(i, key) AS ("
             f"SELECT 0, json_extract({source}, '$[0]') UNION ALL "
             f"SELECT i+1, json_extract({source}, '$[' || (i+1) || ']') "
             f"FROM {alias} WHERE key IS NOT NULL) "
             f"SELECT 1 FROM {alias} WHERE key = {literal(cond.field)} COLLATE BINARY)"
         )
+        if not set(cond.field) - {" ", ","}:
+            # Such a name could span the separator between two elements.
+            return negation + walk
+        # Each extraction re-reads the array from its start. Without a backslash,
+        # every quote in the validated array delimits an element, so the quoted
+        # name occurs exactly when one element equals it.
+        name = literal(json.dumps(cond.field, ensure_ascii=False))
+        return (
+            f"{negation}(CASE WHEN instr({source}, '\\') = 0 "
+            f"THEN instr({source}, {name}) > 0 ELSE {walk} END)"
+        )
+
+    @staticmethod
+    def _unicode_text(guard, unicode, native):
+        # Function results carry no column affinity: 445 = '445' only holds in
+        # SQLite's own comparison. Values that are not TEXT keep that comparison.
+        return f"CASE WHEN {guard} THEN {unicode} ELSE {native} END"
 
     def convert_condition_field_eq_field(self, cond, state):
-        if self.text_mode == "unicode":
-            left, right = self.convert_condition_field_eq_field_escape_and_quote(
-                cond.field, cond.value.field
-            )
-            starts, ends = cond.value.starts_with, cond.value.ends_with
-            if not starts and not ends:
-                lhs = self._strict_function(state, "sigma_casefold", left)
-                rhs = self._strict_function(state, "sigma_casefold", right)
-                return f"{lhs}={rhs}"
-            pattern = self.field_ref_like_escape.format(field2=right)
-            if ends:
-                pattern = "'%' || " + pattern
-            if starts:
-                pattern += " || '%'"
-            return self._strict_function(state, "sigma_unicode_like", left, pattern)
         expression = super().convert_condition_field_eq_field(cond, state)
         # Only equality is collated: the startswith/endswith forms use LIKE.
         if self.collate_nocase and not (cond.value.starts_with or cond.value.ends_with):
-            return self.collation_expression.format(expr=expression)
-        return expression
+            expression = self.collation_expression.format(expr=expression)
+        if self.text_mode != "unicode":
+            return expression
+        left, right = self.convert_condition_field_eq_field_escape_and_quote(
+            cond.field, cond.value.field
+        )
+        starts, ends = cond.value.starts_with, cond.value.ends_with
+        if not starts and not ends:
+            lhs = self._strict_function(state, "sigma_casefold", left)
+            rhs = self._strict_function(state, "sigma_casefold", right)
+            guard = f"typeof({left})='text' AND typeof({right})='text'"
+            return self._unicode_text(guard, f"{lhs}={rhs}", expression)
+        # The pattern is TEXT whatever the type of the referenced field.
+        pattern = self.field_ref_like_escape.format(field2=right)
+        if ends:
+            pattern = "'%' || " + pattern
+        if starts:
+            pattern += " || '%'"
+        unicode = self._strict_function(state, "sigma_unicode_like", left, pattern)
+        return self._unicode_text(f"typeof({left})='text'", unicode, expression)
 
     def resolve_table(self, state=None):
         table = (state or {}).get("table")
@@ -462,9 +482,7 @@ class sqliteBackend(TextQueryBackend):
             raise ValueError(
                 "table must have one or two nonempty name components without NUL"
             )
-        if "." in table:
-            return ".".join(quote(part) for part in table.split("."))
-        return self.escape_and_quote_field(table)
+        return ".".join(self.escape_and_quote_field(part) for part in table.split("."))
 
     def escape_and_quote_field(self, field):
         # SQLite keywords are identifiers only when quoted. This set includes
@@ -870,24 +888,26 @@ class sqliteBackend(TextQueryBackend):
         """
         field = self.escape_and_quote_field(cond.field)
         value = cond.value
-        if self.text_mode == "unicode":
-            pattern = self.convert_value_str(value, state, no_quote=True)
-            return self._strict_function(
-                state, "sigma_unicode_like", field, f"'{pattern}'"
-            )
         if value.contains_special() or any(
             char in value
             for char in (self.wildcard_multi, self.wildcard_single, self.escape_char)
         ):
-            return self.wildcard_match_expression.format(
+            expr = self.wildcard_match_expression.format(
                 field=field, value=self.convert_value_str(value, state, no_quote=True)
             )
-        expr = self.eq_expression.format(
-            field=field, value=self.convert_value_str(value, state), backend=self
+        else:
+            expr = self.eq_expression.format(
+                field=field, value=self.convert_value_str(value, state), backend=self
+            )
+            if self.collate_nocase:
+                expr = self.collation_expression.format(expr=expr)
+        if self.text_mode != "unicode":
+            return expr
+        pattern = self.convert_value_str(value, state, no_quote=True)
+        unicode = self._strict_function(
+            state, "sigma_unicode_like", field, f"'{pattern}'"
         )
-        if self.collate_nocase:
-            return self.collation_expression.format(expr=expr)
-        return expr
+        return self._unicode_text(f"typeof({field})='text'", unicode, expr)
 
     def convert_condition_field_eq_val_str_case_sensitive(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState

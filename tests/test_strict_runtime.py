@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 
 import pytest
@@ -395,3 +396,132 @@ def test_evidence_retains_sqlite_distinct_unicode_column():
             "Host": "host",
             "Keys": "source value",
         }
+
+
+@pytest.mark.parametrize("condition", ["s", "not s"])
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"port|fieldref": "dport"},
+        {"port|fieldref|startswith": "dport"},
+        {"code": "1"},
+        {"port": "44*"},
+        {"big": "1.0e+20"},
+    ],
+)
+def test_unicode_mode_keeps_sqlite_comparison_for_non_text_values(selection, condition):
+    # Function results carry no column affinity. Values that are not TEXT keep
+    # SQLite's own comparison, so the opt-in mode loses no portable match.
+    results = {}
+    for mode in ("portable", "unicode"):
+        entry = entry_for(selection, condition=condition, text_mode=mode)
+        with sqlite3.connect(":memory:") as db:
+            runtime.register_sqlite_functions(db)
+            db.execute(
+                "CREATE TABLE logs(port INTEGER, dport TEXT, code REAL, big REAL)"
+            )
+            db.executemany(
+                "INSERT INTO logs VALUES(?, ?, ?, ?)",
+                [(445, "445", 1.0, 1e20), (80, "8080", None, None)],
+            )
+            sql = entry["rule"][0].replace("SELECT *", "SELECT rowid")
+            results[mode] = db.execute(sql).fetchall()
+    assert results["unicode"] == results["portable"]
+    if condition == "s":
+        assert results["portable"] == [(1,)]
+
+
+@pytest.mark.parametrize("value", [1e20, 100.0, 1 / 3, -2.5e-300])
+def test_strict_helpers_spell_reals_as_sqlite_text(value):
+    with sqlite3.connect(":memory:") as db:
+        runtime.register_sqlite_functions(db)
+        (text,) = db.execute("SELECT CAST(? AS TEXT)", (value,)).fetchone()
+        pattern = "^" + re.escape(text) + "$"
+        assert db.execute(
+            "SELECT regexp(?, ?), sigma_unicode_like(?, ?)",
+            (pattern, value, value, text),
+        ).fetchone() == (1, 1)
+
+
+def test_strict_regexp_reads_blobs_as_text_not_python_repr():
+    with sqlite3.connect(":memory:") as db:
+        runtime.register_sqlite_functions(db)
+        blob = b"\x00abc\xff"
+        patterns = ["^b'", r"\\x00", r"^\x00abc"]
+        assert db.execute(
+            "SELECT regexp(?, ?), regexp(?, ?), regexp(?, ?)",
+            [arg for pattern in patterns for arg in (pattern, blob)],
+        ).fetchone() == (0, 0, 1)
+
+
+def test_function_check_accepts_regexp_returning_null_for_null_input():
+    entry = entry_for({"v|re": "^a"}, text_mode="unicode")
+    assert "regexp" in entry["required_sql_functions"]
+    with sqlite3.connect(":memory:") as db:
+        runtime.register_sqlite_functions(db)
+        db.create_function(
+            "regexp",
+            2,
+            lambda p, v: None if v is None else int(re.search(p, v) is not None),
+        )
+        db.execute("CREATE TABLE logs(v)")
+        runtime.validate_entry(db, entry)
+
+
+def test_missing_cidr_function_points_to_register_cidr():
+    with sqlite3.connect(":memory:") as db:
+        with pytest.raises(ValueError, match=r"call register_cidr\(connection\)"):
+            runtime.validate_sql_functions(db, ["sigma_cidr_contains"])
+
+
+def test_presence_reads_escape_free_arrays_without_the_json_walk():
+    entry = entry_for({"User|exists": True}, presence_field="keys")
+    walked = []
+
+    def json_extract(document, path):
+        walked.append(document)
+        if document is None:
+            return None
+        items = json.loads(document)
+        index = int(path[2:-1])
+        return items[index] if index < len(items) else None
+
+    escaped = '["\\u0055ser"]'
+    with sqlite3.connect(":memory:") as db:
+        # Count the walk by overriding the built-in for this connection only.
+        db.create_function("json_extract", 2, json_extract)
+        db.execute("CREATE TABLE logs(keys TEXT)")
+        db.executemany(
+            "INSERT INTO logs VALUES (?)",
+            [('["user"]',), ('["a", "User"]',), (escaped,), (None,)],
+        )
+        sql = entry["rule"][0].replace("SELECT *", "SELECT rowid")
+        assert db.execute(sql).fetchall() == [(2,), (3,)]
+    # A NULL list takes the walk too; it ends after one extraction.
+    assert set(walked) == {escaped, None}
+
+
+PRESENCE_NAMES = ["User", "user", ",", " ", ", ", "[", "a,b", 'a"b', "a\\b", "é", "a b"]
+
+
+@pytest.mark.parametrize("field", PRESENCE_NAMES)
+@pytest.mark.parametrize("flag", [True, False])
+def test_presence_matches_decoded_names_in_every_json_spelling(field, flag):
+    entry = entry_for({f"{field}|exists": flag}, presence_field="keys")
+    arrays = [[], [field], ["x", field], [n for n in PRESENCE_NAMES if n != field]]
+    documents = [
+        json.dumps(keys, ensure_ascii=ascii, separators=separators)
+        for keys in arrays
+        for ascii in (True, False)
+        for separators in ((",", ":"), (", ", ": "), (" , ", ": "))
+    ]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(keys TEXT)")
+        db.executemany("INSERT INTO logs VALUES (?)", [(d,) for d in documents])
+        runtime.validate_entry(db, entry)
+        sql = entry["rule"][0].replace("SELECT *", "SELECT rowid")
+        found = [rowid for (rowid,) in db.execute(sql)]
+    expected = [
+        i + 1 for i, d in enumerate(documents) if (field in json.loads(d)) == flag
+    ]
+    assert found == expected

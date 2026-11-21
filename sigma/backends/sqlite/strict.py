@@ -2,6 +2,8 @@
 
 import math
 import re
+import sqlite3
+from contextlib import closing
 from decimal import Decimal
 from fractions import Fraction
 from functools import lru_cache
@@ -10,6 +12,24 @@ from itertools import accumulate
 from .cidr import register_cidr
 
 PRESENCE_REPRESENTATION = "field-names-v1"
+
+
+@lru_cache(maxsize=1024)
+def _real_text(value):
+    # SQLite 3.38 keeps 15 significant digits and newer releases round-trip with
+    # up to 17, so ask the linked library instead of formatting in Python.
+    with closing(sqlite3.connect(":memory:")) as connection:
+        return connection.execute("SELECT CAST(? AS TEXT)", (value,)).fetchone()[0]
+
+
+def _sqlite_text(value):
+    """Spell a value as CAST(value AS TEXT) does, not as Python's str() does."""
+    if isinstance(value, float):
+        return _real_text(value)
+    if isinstance(value, bytes):
+        # SQLite reads BLOB bytes as UTF-8 text. Keep invalid bytes distinct.
+        return value.decode("utf-8", "surrogateescape")
+    return str(value)
 
 
 def _like_tokens(pattern):
@@ -45,7 +65,7 @@ def _unicode_like(value, pattern, compile_pattern):
     tokens = compile_pattern(pattern)
     if tokens is None:
         return 0
-    source = str(value)
+    source = _sqlite_text(value)
     folded = source.casefold()
     if len(tokens) == 1 and tokens[0][0] == "literal":
         return folded == tokens[0][1]
@@ -193,7 +213,7 @@ def register_sqlite_functions(connection):
         lambda pattern, value: (
             value is not None
             and pattern is not None
-            and re.search(pattern, str(value)) is not None
+            and re.search(pattern, _sqlite_text(value)) is not None
         ),
         deterministic=True,
     )

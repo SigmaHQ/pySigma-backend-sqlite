@@ -7,6 +7,7 @@ finalized query or output-format dictionary is ever used as a predicate.
 
 from __future__ import annotations
 
+import copyreg
 import hashlib
 import itertools
 import json
@@ -200,6 +201,11 @@ class ReferenceConversionError(SigmaCorrelationRuleError):
             f"Correlation {parent.title!r} references {dependency!r}, which {reason}",
             source=parent.source,
         )
+
+    def __reduce__(self):
+        # Exceptions copy and unpickle by calling the class with self.args, which
+        # holds only the message. Restore the instance state without __init__.
+        return copyreg.__newobj__, (type(self),), {**vars(self), "args": self.args}
 
 
 @dataclass(frozen=True, slots=True)

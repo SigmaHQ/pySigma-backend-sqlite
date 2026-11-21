@@ -1,6 +1,8 @@
 """Run retained conditions and their exported prerequisites through public entry points."""
 
+import copy
 import json
+import pickle
 import sqlite3
 
 import pytest
@@ -14,6 +16,7 @@ from sigma.exceptions import (
 from sigma.processing.pipeline import ProcessingPipeline
 
 from sigma.backends.sqlite import sqliteBackend
+from sigma.backends.sqlite.correlation import ReferenceConversionError
 from sigma.backends.sqlite.runtime import execute_plan
 
 
@@ -488,3 +491,17 @@ def test_custom_storage_can_disable_prefilter_bounds():
         assert db.execute(entry["rule"][0]).fetchall() == [("System ", 1)]
     with pytest.raises(ValueError, match="prefilter_bounds"):
         sqliteBackend(prefilter_bounds=[])
+
+
+def test_reference_errors_survive_pickling_and_copying():
+    rules = SigmaCollection.from_dicts([detection(), correlation(name="parent")])
+    rules.resolve_rule_references()
+    error = ReferenceConversionError(rules.rules[1], "child", "failed to convert")
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+        assert type(clone) is ReferenceConversionError
+        assert (str(clone), clone.dependency, clone.reason, clone.source) == (
+            str(error),
+            "child",
+            "failed to convert",
+            error.source,
+        )

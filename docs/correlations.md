@@ -31,8 +31,8 @@ Thresholds may be fractional (pySigma 2) and are compared exactly:
   position. Evidence includes the events and child alerts at those times for
   every successful choice. For `eq`, `neq`, `lt` and `lte`, all observed
   reference positions must occur in order and the count must pass the comparison.
-- When the threshold requires every reference, each window tracks one earliest
-  witness timestamp per position. Events tied at a witness time all contribute
+- When an ordered threshold requires every reference, each window tracks one
+  earliest witness timestamp per position. Events tied at a witness time all contribute
   evidence.
 - **Extended OR branches** are evaluated independently; their evidence is merged
   when they describe the same window.

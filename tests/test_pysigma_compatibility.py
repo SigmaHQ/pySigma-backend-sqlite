@@ -342,3 +342,30 @@ def test_bounded_regex_survives_placeholder_expansion(boundary, expected, attemp
             "INSERT INTO logs VALUES (?)", [("xHELLO",), ("HELLOx",), ("bye",)]
         )
         assert [v for (v,) in db.execute(sql)] == expected
+
+
+@pytest.mark.parametrize("modifiers", ["contains|windash", "cased|contains|windash"])
+@pytest.mark.parametrize(
+    "value,matches,misses",
+    [
+        (" -urlcache -f http://", "c /urlcache –f http://x", "c -urlcache -f http:––x"),
+        (
+            "--remote-debugging-port",
+            "-/remote-debugging-port",
+            "-/remote–debugging-port",
+        ),
+    ],
+)
+def test_windash_beyond_three_dashes_expands_word_start_dashes(
+    modifiers, value, matches, misses
+):
+    # pySigma limits only dashes that start a word. Expand those as pySigma does
+    # instead of rejecting a rule that pySigma itself accepts.
+    rules = SigmaCollection.from_dicts([rule({f"message|{modifiers}": value})])
+    (sql,) = sqliteBackend().convert(rules)
+    upper = matches.upper()
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(message TEXT)")
+        db.executemany("INSERT INTO logs VALUES (?)", [(matches,), (misses,), (upper,)])
+        found = [v for (v,) in db.execute(sql)]
+    assert found == ([matches] if "cased" in modifiers else [matches, upper])

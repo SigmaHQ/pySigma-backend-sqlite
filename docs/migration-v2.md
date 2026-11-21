@@ -90,6 +90,13 @@ Structured callbacks may keep or drop individual queries. A callback that
 substitutes SQL should request plain output. Derived structured entries need
 the compiler's source fields and matching execution plan.
 
+In plain output, a parent correlation now reads the rows of a referenced
+correlation whose SQL a callback replaced. Earlier releases recompiled the
+child and ignored the replacement. The parent reads `alert_id`,
+`occurrence_time`, `metric_value`, `event_ids` and, for grouped rules,
+`group_keys`. A replacement that drops or renames one of those columns makes
+the parent query fail when SQLite prepares it.
+
 With default options, existing consumers receive schema versions 2–4.
 Enabling Unicode matching, per-row presence, or exact aggregation can produce
 schema 5. Upgrade the executor before distributing those entries. Existing

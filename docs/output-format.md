@@ -73,10 +73,15 @@ correlation includes the regex requirements of its retained references.
 
 | Name | SQL and data contract |
 |---|---|
-| `regexp(pattern, value)` | Python `re.search` with inline flags. A NULL value returns false. |
+| `regexp(pattern, value)` | Python `re.search` with inline flags. A NULL value returns false. Other values are searched as `CAST(value AS TEXT)` spells them, and a BLOB as UTF-8 text. The runtime check also accepts an implementation that returns NULL for a NULL value. |
 | `sigma_cidr_contains(address, network)` | Exact network membership, as in schema 4. |
-| `sigma_unicode_like(value, pattern)` | Unicode default case folding. Unescaped SQL `%` and `_` match zero or more source code points and one source code point respectively. Backslash escapes the next pattern character. |
+| `sigma_unicode_like(value, pattern)` | Unicode default case folding. Unescaped SQL `%` and `_` match zero or more source code points and one source code point respectively. Backslash escapes the next pattern character. A REAL is read as `CAST(value AS TEXT)` spells it; a BLOB returns false. |
 | `sigma_casefold(value)` | Python `str.casefold()` for text. Other SQLite types retain their values. Used for field equality, grouping and distinct counts. |
+
+Generated predicates call `sigma_unicode_like` and `sigma_casefold` only when
+the compared values are TEXT. Other values keep SQLite's comparison, including
+column affinity, so INTEGER `445` still equals TEXT `'445'` and REAL `1.0`
+equals `'1'`.
 | `sigma_exact_sum(value)` | Integer-preserving aggregate/window function. An integer result in the signed 64-bit range has SQLite type INTEGER. A wider integer has type TEXT with its canonical base-10 spelling. A mixed REAL window yields REAL. |
 | `sigma_numeric_cmp(left, right)` | Numeric comparison across those result types. Returns −1, 0 or 1, or NULL for a missing operand. |
 
@@ -112,8 +117,11 @@ Capture the list before widening absent fields to NULL. A database containing
 only the widened columns requires the original source keys or re-ingestion.
 `validate_entry` and `execute_plan` scan every declared presence column and
 reject missing columns and malformed rows before widening the schema.
-`exists` scans the array by index with `json_extract`, so event tables can
-use the names `json_each` and `json_tree`.
+`exists` searches an array without a backslash for the JSON-quoted name with
+`instr`. An array containing a JSON escape is read element by element with
+`json_extract`, whose cost grows with the square of the array length. Neither
+form uses a JSON virtual table, so event tables can use the names `json_each`
+and `json_tree`.
 `execute_plan` omits the internal presence and fulltext columns from the
 corresponding source table's evidence using SQLite's ASCII-only identifier
 folding. With `connection.text_factory = bytes`, source TEXT values in evidence
@@ -136,9 +144,11 @@ with presence. The table below reports median wall time in milliseconds.
 | Portable literal equality, NOCASE index | 0.18 | 0.16 |
 | Unicode literal equality, same index available | 7.50 | 7.65 |
 | Validate presence on every row | 26.54 | 26.90 |
-| Retrieve all rows with `opt` present, including NULL | 23.15 | 23.56 |
+| Retrieve all rows with `opt` present, including NULL | — | 8.11 |
 
-The emitted equality selects returned the same 200 event IDs. On both engines
+The retrieval row was re-measured only on SQLite 3.54.1, with Python 3.13,
+after `exists` began using `instr`. The emitted equality selects returned the
+same 200 event IDs. On both engines
 `EXPLAIN QUERY PLAN` reported an index search for portable equality, a table
 scan for Unicode equality, and a table scan plus a recursive lookup
 for source-aware existence. Before indexing, portable equality took 0.80 and

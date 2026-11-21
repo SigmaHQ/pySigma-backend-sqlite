@@ -1564,3 +1564,26 @@ def test_correlation_temporal_ordered_extended_condition():
             condition: rule_a and rule_b
     """
     ) == {"ordered"}
+
+
+@pytest.mark.parametrize(
+    "table,expected",
+    [
+        ("main.logs", "main.logs"),
+        ("temp.order", "`temp`.`order`"),
+        ("main.my-logs", "main.`my-logs`"),
+    ],
+)
+def test_dotted_table_quotes_only_components_that_need_it(table, expected):
+    rules = SigmaCollection.from_dicts(
+        [
+            {
+                "title": "t",
+                "logsource": {"category": "test"},
+                "detection": {"s": {"EventID": 1}, "condition": "s"},
+            }
+        ]
+    )
+    (entry,) = json.loads(sqliteBackend(table=table).convert(rules, "zircolite"))
+    assert entry["source_table"] == expected
+    assert f" FROM {expected} WHERE " in entry["rule"][0]

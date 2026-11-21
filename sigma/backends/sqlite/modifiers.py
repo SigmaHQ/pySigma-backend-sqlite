@@ -4,7 +4,6 @@ import re
 from copy import copy
 from dataclasses import dataclass, replace
 
-from sigma.exceptions import SigmaModifiedError
 from sigma.modifiers import (
     SigmaEndswithModifier,
     SigmaRegularExpressionModifier,
@@ -13,34 +12,46 @@ from sigma.modifiers import (
 )
 from sigma.processing.transformations.base import DetectionItemTransformation
 from sigma.types import (
+    SigmaCasedString,
     SigmaExpansion,
     SigmaRegularExpression,
     SigmaString,
 )
+
+# Hyphen-minus, slash, en dash, em dash and horizontal bar.
+DASHES = "-/–—―"
 
 
 class _WindowsDash(SigmaWindowsDashModifier):
     def modify(self, val: SigmaString) -> SigmaExpansion:
         # Canonicalize every dash position, including dashes inside a token.
         # Keep wildcard tokens and pre-existing placeholders intact.
+        dashes = sum(
+            part.count(dash)
+            for part in val.s
+            if isinstance(part, str)
+            for dash in DASHES
+        )
+        if dashes > self.max_expanded_dashes:
+            # pySigma limits only the dashes that start a word, as in "-a" or
+            # " /b". Expand those, as pySigma does, rather than rejecting a path,
+            # URL or hyphenated name that pySigma itself accepts.
+            expansion = super().modify(val)
+            if isinstance(val, SigmaCasedString):
+                # pySigma's placeholder expansion returns plain strings.
+                expansion.values = [
+                    SigmaCasedString.from_sigma_string(v) for v in expansion.values
+                ]
+            return expansion
         alternatives = [type(val)()]
-        count = 0
         for part in val.s:
             if not isinstance(part, str):
                 alternatives = [prefix + part for prefix in alternatives]
                 continue
-            for token in re.split("([/–—―-])", part):
+            for token in re.split(f"([{DASHES}])", part):
                 if not token:
                     continue
-                choices = [token]
-                if token in ("/", "–", "—", "―", "-"):
-                    count += 1
-                    if count > self.max_expanded_dashes:
-                        raise SigmaModifiedError(
-                            "windash modifier expands at most three dash occurrences in one value",
-                            source=self.source,
-                        )
-                    choices = list("-/–—―")
+                choices = list(DASHES) if token in DASHES else [token]
                 alternatives = [prefix + s for prefix in alternatives for s in choices]
         return SigmaExpansion(alternatives)
 
