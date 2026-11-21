@@ -47,6 +47,7 @@ from .correlation import (
     SQL_INFINITY,
     CorrelationCompiler,
     ReferenceConversionError,
+    ReplacedCorrelation,
     literal,
     numeric,
     quote,
@@ -400,7 +401,8 @@ class sqliteBackend(TextQueryBackend):
             return super().convert_condition_field_eq_val_exists(cond, state)
         table = self.resolve_table(state.processing_state)
         state.sqlite_presence_source = (table, field)
-        # Qualify the outer column since json_each itself exposes names such as 'value'.
+        # Walk the validated array with scalar JSON extraction. Tables elsewhere
+        # on the connection may shadow either of SQLite's JSON virtual tables.
         source = f"{table}.{quote(field)}"
         table_name = (
             (state.processing_state.get("table") or self.table)
@@ -408,12 +410,13 @@ class sqliteBackend(TextQueryBackend):
             .lower()
         )
         alias = "field_names" if table_name == "presence_keys" else "presence_keys"
-        # Either JSON virtual table enumerates the text leaves of an array of names.
-        each = "json_tree" if table_name == "json_each" else "json_each"
         negation = "" if cond.value.exists else "NOT "
         return (
-            f"{negation}EXISTS (SELECT 1 FROM {each}({source}) AS {alias} "
-            f"WHERE {alias}.type = 'text' AND {alias}.value = {literal(cond.field)} COLLATE BINARY)"
+            f"{negation}EXISTS (WITH RECURSIVE {alias}(i, key) AS ("
+            f"SELECT 0, json_extract({source}, '$[0]') UNION ALL "
+            f"SELECT i+1, json_extract({source}, '$[' || (i+1) || ']') "
+            f"FROM {alias} WHERE key IS NOT NULL) "
+            f"SELECT 1 FROM {alias} WHERE key = {literal(cond.field)} COLLATE BINARY)"
         )
 
     def convert_condition_field_eq_field(self, cond, state):
@@ -553,12 +556,15 @@ class sqliteBackend(TextQueryBackend):
         # The dependency marker belongs to this attempt. An intermediate rule
         # with generate disabled still has a successful conversion result.
         rule._sqlite_dependency_failure = (rule.title, "failed to convert")
-        replaced = False
+        replacement = None
 
         def select(rule, fmt, index, query, predicate):
-            nonlocal replaced
+            nonlocal replacement
             result = self._callback_result(callback, rule, fmt, index, query, predicate)
-            replaced = result is not None and result != predicate
+            if result is not None and result != predicate:
+                replacement = ReplacedCorrelation(
+                    result, self._correlation_plans[id(rule)]["source_tables"]
+                )
             return result
 
         try:
@@ -567,7 +573,7 @@ class sqliteBackend(TextQueryBackend):
             )
             if rule.get_conversion_result():
                 del rule._sqlite_dependency_failure
-                rule.get_conversion_states()[0].sqlite_replaced = replaced
+                rule.get_conversion_states()[0].sqlite_replacement = replacement
             else:
                 rule._sqlite_dependency_failure = (rule.title, "has no compiled query")
             return output

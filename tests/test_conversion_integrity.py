@@ -157,6 +157,100 @@ def test_structured_replacement_reports_the_rule_and_plain_sql_honors_it(
     assert backend.convert(rules, "zircolite")
 
 
+@pytest.mark.parametrize(
+    "minimum,expected", [(99, []), (2, [(2, ["1:id:\x00a", "1:id:\x00b"])])]
+)
+def test_plain_sql_parent_consumes_replaced_child_rows(minimum, expected):
+    # The extra reference is the parent's first source. The child's table ID
+    # changes from 0 to 1 inside the parent.
+    docs = [
+        detection("other", 99),
+        detection(),
+        correlation(name="child", condition={"gte": 1}),
+        correlation(
+            "value_sum", ("other", "child"), {"field": "sigma_metric", "gte": 1}
+        ),
+    ]
+    backend = sqliteBackend(
+        pipeline(for_title("other", type="set_state", key="table", val="other_logs")),
+        event_id_field="id",
+    )
+    calls = []
+
+    def select(rule, fmt, index, condition, sql):
+        if rule.name == "child":
+            calls.append(rule.name)
+            return f"SELECT * FROM ({sql}) WHERE metric_value >= {minimum}"
+        return sql
+
+    (parent,) = backend.convert(SigmaCollection.from_dicts(docs), callback=select)
+    assert calls == ["child"]
+    with sqlite3.connect(":memory:") as db:
+        db.execute(
+            "CREATE TABLE other_logs(Host, EventID, timestamp, sigma_metric, id)"
+        )
+        db.execute("CREATE TABLE logs(Host, EventID, timestamp, id)")
+        db.executemany(
+            "INSERT INTO logs VALUES('h',1,?,?)",
+            [("2025-01-01", "id:\x00a"), ("2025-01-01T00:00:01", "id:\x00b")],
+        )
+        rows = db.execute(parent).fetchall()
+    assert [(row[6], json.loads(row[8])) for row in rows] == expected
+
+
+def test_plain_sql_parent_reads_replacement_metric_and_complete_group_text():
+    docs = [
+        detection(),
+        correlation(name="child", condition={"gte": 1}),
+        correlation("value_sum", ("child",), {"field": "sigma_metric", "eq": 8}),
+    ]
+    # Include both a literal JSON escape spelling and the corresponding control
+    # character to distinguish escaping from actual data.
+    group = "one\x00two\\u0000three\x01"
+
+    def replace(rule, fmt, i, cond, sql):
+        if rule.name == "child":
+            return (
+                "SELECT alert_id, occurrence_time, event_ids, "
+                "json_object('Host', ?) AS group_keys, metric_value + 7 AS metric_value "
+                f"FROM ({sql})"
+            )
+        return sql
+
+    (query,) = sqliteBackend().convert(
+        SigmaCollection.from_dicts(docs), callback=replace
+    )
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(Host, EventID, timestamp)")
+        db.execute("INSERT INTO logs VALUES('h',1,'2025-01-01')")
+        (row,) = db.execute(query, (group,)).fetchall()
+    assert (json.loads(row[1]), row[6]) == ({"Host": group}, 8)
+
+
+def test_reconvert_replaced_child_when_its_source_table_changes():
+    rules = SigmaCollection.from_dicts(
+        [
+            detection(),
+            correlation(name="child"),
+            correlation(refs=("child",), name="parent"),
+        ]
+    )
+    rules.resolve_rule_references()
+    base, child, parent = rules.rules
+    backend = sqliteBackend()
+    backend.convert_rule(base)
+    backend.convert_correlation_rule(
+        child, callback=lambda *args: args[-1] + " LIMIT 1"
+    )
+    sqliteBackend(table="archive").convert_rule(base)
+    with pytest.raises(SigmaCorrelationRuleError, match="child.*source tables"):
+        backend.convert_correlation_rule(parent)
+    backend.convert_correlation_rule(
+        child, callback=lambda *args: args[-1] + " LIMIT 1"
+    )
+    assert backend.convert_correlation_rule(parent)
+
+
 def test_failed_intermediate_blocks_all_parents_until_retry():
     steps = pipeline(for_title("child", type="rule_failure", message="child rejected"))
     docs = [

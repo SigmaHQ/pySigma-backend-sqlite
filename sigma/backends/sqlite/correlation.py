@@ -56,6 +56,47 @@ def json_array_function(tables):
     return "json_each"
 
 
+def protect_json_text(document):
+    """Keep embedded NULs intact when SQLite 3.38 decodes JSON strings.
+
+    U+0001 followed by 0 or 1 represents NUL or U+0001 respectively. Escape
+    literal backslashes first, so a string containing the six characters
+    backslash-u-0-0-0-0 stays distinct from the code point.
+    """
+    return (
+        rf"replace(replace(replace({document}, '\\', '\u005c'), "
+        r"'\u0001', '\u00011'), '\u0000', '\u00010')"
+    )
+
+
+def restore_text(value):
+    return (
+        f"CASE WHEN instr({value}, char(1)) THEN "
+        f"replace(replace({value}, char(1)||'0', char(0)), char(1)||'1', char(1)) "
+        f"ELSE {value} END"
+    )
+
+
+def evidence_id(value):
+    # Keep the common identifier path native. The two control codes are
+    # encoded in sort order before the ID enters any internal JSON array.
+    protected = protect_json_text(f"json_quote({value})")
+    return (
+        f"CASE WHEN instr({value}, char(0)) OR instr({value}, char(1)) "
+        f"THEN json_extract({protected}, '$') ELSE {value} END"
+    )
+
+
+def public_ids(document):
+    # Restore the escaped code points in the serialized result. This preserves
+    # full strings even on SQLite versions that truncate decoded JSON scalars.
+    return (
+        rf"CASE WHEN instr({document}, '\u0001') THEN "
+        rf"replace(replace(replace({document}, '\\', '\u005c'), "
+        rf"'\u00010', '\u0000'), '\u00011', '\u0001') ELSE {document} END"
+    )
+
+
 def digest(rule, length: int) -> str:
     """Stable hex identity of a rule's content."""
     identity = json.dumps(rule.to_dict(), sort_keys=True, default=str)
@@ -168,6 +209,12 @@ class Stage:
     indexes: list[list[str]]
 
 
+@dataclass(frozen=True, slots=True)
+class ReplacedCorrelation:
+    sql: str
+    source_tables: dict[str, str]
+
+
 class CorrelationCompiler:
     """Compile an already processed, resolved correlation dependency graph."""
 
@@ -178,6 +225,7 @@ class CorrelationCompiler:
         self.stages: list[Stage] = []
         self.stage_functions: set[str] = set()
         self.nodes = {}
+        self.replacements: dict[int, ReplacedCorrelation] = {}
         self.active = set()
         self.records = {}
         self.fields = set()
@@ -209,15 +257,26 @@ class CorrelationCompiler:
             failure = getattr(rule, "_sqlite_dependency_failure", None)
             if failure is not None:
                 raise ReferenceConversionError(self.root, *failure)
-            if self.structured and isinstance(rule, SigmaCorrelationRule):
+            if isinstance(rule, SigmaCorrelationRule):
                 try:
                     states = rule.get_conversion_states()
                 except SigmaConversionError:
                     states = []
-                if any(getattr(state, "sqlite_replaced", False) for state in states):
-                    raise ReferenceConversionError(
-                        self.root, rule.title, "has callback-replaced SQL"
-                    )
+                for state in states:
+                    replacement = getattr(state, "sqlite_replacement", None)
+                    if replacement is not None:
+                        if self.structured:
+                            raise ReferenceConversionError(
+                                self.root, rule.title, "has callback-replaced SQL"
+                            )
+                        if (
+                            not isinstance(replacement.sql, str)
+                            or not replacement.sql.strip()
+                        ):
+                            raise ReferenceConversionError(
+                                self.root, rule.title, "has no compiled query"
+                            )
+                        self.replacements[id(rule)] = replacement
         if id(rule) in self.active:
             raise SigmaCorrelationRuleError(
                 f"Correlation {rule.title!r} has cyclic references", source=rule.source
@@ -268,9 +327,6 @@ class CorrelationCompiler:
             if target.reference in names
         }
 
-    def _field(self, payload, field):
-        return f"json_extract({payload}, '$.{self.field_ids[field]}')"
-
     def _physical_fields(self, rule, wanted):
         if not isinstance(rule, SigmaCorrelationRule):
             for state in self.records[id(rule)]:
@@ -295,24 +351,21 @@ class CorrelationCompiler:
                     f"({predicate.sql})"
                 )
                 self.required_by_table[predicate.table].update(predicate.fields)
-        self.raw_tables = []
+        self.raw_tables = {}
         for i, (table, rules) in enumerate(by_table.items()):
             self.source_tables[str(i)] = table
             fields = self.required_by_table[table]
             fields.add(self.backend.timestamp_field)
             if self.backend.event_id_field.lower() != "rowid":
                 fields.add(self.backend.event_id_field)
-            payload = json_object(
-                [
-                    (
-                        fid,
-                        f"CASE WHEN typeof({quote(field)})='real' "
-                        f"AND abs({quote(field)}) >= {SQL_INFINITY} THEN NULL ELSE {quote(field)} END",
-                    )
-                    for field, fid in self.field_ids.items()
-                    if field in fields
-                ]
-            )
+            # Keep source values in SQLite columns. JSON extraction on SQLite
+            # 3.38 truncates text at embedded NULs, before numeric or text matching.
+            columns = [
+                f"CASE WHEN typeof({quote(field)})='real' "
+                f"AND abs({quote(field)}) >= {SQL_INFINITY} THEN NULL ELSE {quote(field)} END AS {fid}"
+                for field, fid in self.field_ids.items()
+                if field in fields
+            ]
             flags = [
                 f"COALESCE(({self.backend._join_operands(predicates, ' OR ')}), 0) AS b{j}"
                 for j, predicates in enumerate(rules.values())
@@ -321,11 +374,11 @@ class CorrelationCompiler:
             event_id = f"CAST({quote(self.backend.event_id_field)} AS TEXT)"
             raw = self.add(
                 f"raw{i}",
-                f"SELECT {event_id} AS rid, {literal(str(i) + ':')} || {event_id} AS eid, "
-                f"{time} AS ts, {payload} AS payload, {', '.join(flags)} FROM {table}",
+                f"SELECT {event_id} AS rid, {literal(str(i) + ':')} || {evidence_id(event_id)} AS eid, "
+                f"{time} AS ts, {', '.join(columns + flags)} FROM {table}",
                 [("eid",), ("ts",)],
             )
-            self.raw_tables.append(raw)
+            self.raw_tables[raw] = table
             for j, key in enumerate(rules):
                 self.raw.setdefault(key, []).append((raw, f"b{j}"))
             self.diagnostic_queries.append(
@@ -345,24 +398,47 @@ class CorrelationCompiler:
             )
         self.horizon = self.add("horizon", f"SELECT {expr} AS ts")
 
-    def source(self, rule):
+    def raw_field(self, raw, field):
+        table = self.raw_tables[raw]
+        return (
+            self.field_ids[field] if field in self.required_by_table[table] else "NULL"
+        )
+
+    def source(self, rule, fields):
         if not isinstance(rule, SigmaCorrelationRule):
+            columns = "".join(f", {self.field_ids[f]}" for f in fields)
             return " UNION ALL ".join(
-                f"SELECT 'e:' || eid AS eid, ts, payload, json_array(eid) AS evidence, "
-                f"'[]' AS children FROM {raw} WHERE {flag}"
+                f"SELECT 'e:' || eid AS eid, ts, json_array(eid) AS evidence, "
+                f"'[]' AS children{columns} FROM {raw} WHERE {flag}"
                 for raw, flag in self.raw[id(rule)]
             )
         result = self.compile_node(rule)
-        # Rehydrate fields the parent needs from the child's evidence; summary
-        # fields override raw values. Parent event_count still counts child IDs.
-        union = " UNION ALL ".join(
-            f"SELECT eid, payload FROM {raw}" for raw in self.raw_tables
+        # Child metrics and grouping keys belong to the alert. Other parent
+        # fields are read from the raw events that contributed to that alert.
+        summary = {f: f"c.g{i}" for i, f in enumerate(rule.group_by or [])}
+        for name in (rule.type.name.lower(), "sigma_metric"):
+            summary.setdefault(name, "c.metric")
+        evidence_fields = [f for f in fields if f not in summary]
+        join = ""
+        if evidence_fields:
+            sources = []
+            for raw in self.raw_tables:
+                columns = "".join(
+                    f", {self.raw_field(raw, f)} AS {self.field_ids[f]}"
+                    for f in evidence_fields
+                )
+                sources.append(f"SELECT eid{columns} FROM {raw}")
+            join = (
+                f" JOIN {self.array_items}(c.evidence) e ON e.type='text'"
+                f" JOIN ({' UNION ALL '.join(sources)}) r ON r.eid=e.value"
+            )
+        columns = "".join(
+            f", {summary.get(f, 'r.' + self.field_ids[f])} AS {self.field_ids[f]}"
+            for f in fields
         )
         return (
             f"SELECT DISTINCT 'c:' || c.alert_id AS eid, c.end AS ts, "
-            f"json_patch(r.payload, c.payload) AS payload, c.evidence, "
-            f"json_array(c.alert_id) AS children FROM {result} c "
-            f"JOIN {self.array_items}(c.evidence) e ON e.type='text' JOIN ({union}) r ON r.eid=e.value"
+            f"c.evidence, json_array({evidence_id('c.alert_id')}) AS children{columns} FROM {result} c{join}"
         )
 
     @staticmethod
@@ -384,13 +460,14 @@ class CorrelationCompiler:
     def contexts(self, rule, fields):
         """Project observed context through the same aliases as rule membership."""
         if not isinstance(rule, SigmaCorrelationRule):
-            columns = "".join(
-                f", {self.group_key(self._field('payload', field))} AS g{i}"
-                for i, field in enumerate(fields)
-            )
-            return [
-                f"SELECT eid, ts{columns} FROM {raw}" for raw, _ in self.raw[id(rule)]
-            ]
+            sources = []
+            for raw, _ in self.raw[id(rule)]:
+                columns = "".join(
+                    f", {self.group_key(self.raw_field(raw, f))} AS g{i}"
+                    for i, f in enumerate(fields)
+                )
+                sources.append(f"SELECT eid, ts{columns} FROM {raw}")
+            return sources
         sources = []
         for ref in rule.referenced_rules:
             mapping = self._alias_mapping(rule, ref)
@@ -442,6 +519,31 @@ class CorrelationCompiler:
         wg = "".join(f", w.{g}" for g in gs)
         ng = "".join(f", n.{g}" for g in gs)
         cols = ", ".join(["end", *gs])
+        anchors = f"(SELECT DISTINCT ts AS end{groups} FROM {matches})"
+        target = "metric"
+        if op in (">", ">="):
+            target = math.floor(count) + 1 if op == ">" else math.ceil(count)
+        if target == nslots or (op == "=" and count == nslots):
+            # With every slot required there is only one greedy path per anchor.
+            # Each step seeks the next timestamp on the (group, slot, ts) index.
+            path = self.add(
+                stem + "_path",
+                f"WITH RECURSIVE path({cols}, slot, ts) AS ("
+                f"SELECT a.end{ag}, 0, (SELECT MIN(m.ts) FROM {matches} m WHERE "
+                f"{self.group_equal('m', 'a', len(gs))}m.slot=0 AND m.ts BETWEEN a.end-{span} AND a.end) "
+                f"FROM {anchors} a UNION ALL "
+                f"SELECT a.end{ag}, a.slot+1, (SELECT MIN(m.ts) FROM {matches} m WHERE "
+                f"{self.group_equal('m', 'a', len(gs))}m.slot=a.slot+1 AND m.ts>a.ts AND m.ts<=a.end) "
+                f"FROM path a WHERE a.ts IS NOT NULL AND a.slot<{nslots - 1}) "
+                f"SELECT * FROM path WHERE ts IS NOT NULL",
+                [gs + ["end", "slot"]],
+            )
+            return (
+                f"SELECT w.end-{span} AS start, w.end{wg}, {nslots} AS metric, m.evidence, m.children "
+                f"FROM {path} w JOIN {path} last ON {self.group_equal('last', 'w', len(gs))}"
+                f"last.end=w.end AND last.slot={nslots - 1} "
+                f"JOIN {matches} m ON {self.group_equal('m', 'w', len(gs))}m.slot=w.slot AND m.ts=w.ts"
+            )
         slots = ", ".join([*gs, "slot"])
         positions = self.add(
             stem + "_positions",
@@ -449,7 +551,6 @@ class CorrelationCompiler:
             f"FROM (SELECT DISTINCT ts, slot{groups} FROM {matches})",
             [gs + ["ts"]],
         )
-        anchors = f"(SELECT DISTINCT ts AS end{groups} FROM {matches})"
         nodes = self.add(
             stem + "_window_nodes",
             f"SELECT a.end{ag}, p.slot, p.ts, p.prev, "
@@ -457,9 +558,6 @@ class CorrelationCompiler:
             f"(PARTITION BY a.end{ag}) AS metric FROM {anchors} a JOIN {positions} p "
             f"ON {self.group_equal('p', 'a', len(gs))}p.ts BETWEEN a.end-{span} AND a.end",
         )
-        target = "metric"
-        if op in (">", ">="):
-            target = math.floor(count) + 1 if op == ">" else math.ceil(count)
         if target != "metric" and target <= 0:
             # The empty subset imposes no ordering and contributes all evidence.
             winning = nodes
@@ -487,6 +585,41 @@ class CorrelationCompiler:
             f"m.slot=w.slot AND m.ts=w.ts"
         )
 
+    def replacement_alerts(self, rule, replacement):
+        """Read the public alert columns supplied by a plain SQL callback."""
+        evidence = protect_json_text("c.event_ids")
+        parent_ids = {table: key for key, table in self.source_tables.items()}
+        if any(table not in parent_ids for table in replacement.source_tables.values()):
+            raise ReferenceConversionError(
+                self.root,
+                rule.title,
+                "must be reconverted after its source tables changed",
+            )
+        if any(
+            parent_ids[table] != key for key, table in replacement.source_tables.items()
+        ):
+            # A child numbers its source tables independently of its parent.
+            cases = " ".join(
+                f"WHEN {literal(key)} THEN {literal(parent_ids[table])}"
+                for key, table in replacement.source_tables.items()
+            )
+            colon = "instr(e.value, ':')"
+            evidence = (
+                f"(SELECT json_group_array(CASE substr(e.value, 1, {colon}-1) {cases} END "
+                f"|| substr(e.value, {colon})) FROM {self.array_items}({evidence}) e WHERE e.type='text')"
+            )
+        groups_json = protect_json_text("c.group_keys")
+        keys = "".join(
+            f", (SELECT {restore_text('k.value')} FROM {self.array_items}({groups_json}) k "
+            f"WHERE k.key={literal(field.replace(chr(1), chr(1) + '1'))}) AS g{i}"
+            for i, field in enumerate(rule.group_by or [])
+        )
+        sql = replacement.sql.rstrip().removesuffix(";")
+        return (
+            f"SELECT c.alert_id, c.occurrence_time AS end, c.metric_value AS metric, "
+            f"{evidence} AS evidence{keys} FROM ({sql}\n) c"
+        )
+
     def compile_node(self, rule):
         if id(rule) in self.nodes:
             return self.nodes[id(rule)]
@@ -495,6 +628,12 @@ class CorrelationCompiler:
         stem = f"n{n}"
         kind = rule.type.name.lower()
         group = list(rule.group_by or [])
+        if replacement := self.replacements.get(id(rule)):
+            result = self.add(
+                stem + "_alerts", self.replacement_alerts(rule, replacement)
+            )
+            self.nodes[id(rule)] = result
+            return result
         count = len(group)
         gs = [f"g{i}" for i in range(count)]
         comma_groups = "".join(f", {g}" for g in gs)
@@ -510,11 +649,10 @@ class CorrelationCompiler:
             names[ref.reference] = slot
             names[str(ref.rule.name or ref.rule.id)] = slot
             mapping = self._alias_mapping(rule, ref)
-            groups = [
-                self.group_key(self._field("s.payload", mapping.get(f, f)))
-                for f in group
-            ]
-            values = [self._field("s.payload", mapping.get(f, f)) for f in fields]
+            mapped_groups = [mapping.get(f, f) for f in group]
+            mapped_values = [mapping.get(f, f) for f in fields]
+            groups = [self.group_key(f"s.{self.field_ids[f]}") for f in mapped_groups]
+            values = [f"s.{self.field_ids[f]}" for f in mapped_values]
             if kind in NUMERIC_KINDS:
                 values = [numeric(values[0], wide_integers=exact_sum)]
             if kind == "value_count" and self.backend.text_mode == "unicode":
@@ -527,8 +665,10 @@ class CorrelationCompiler:
                 for raw, flag in self.raw[id(ref.rule)]:
                     ordered_sources.setdefault((raw, columns), []).append((slot, flag))
             else:
+                source_fields = dict.fromkeys(mapped_groups + mapped_values)
                 branches.append(
-                    f"SELECT s.*, {slot} AS slot{columns} FROM ({self.source(ref.rule)}) s"
+                    f"SELECT s.eid, s.ts, s.evidence, s.children, {slot} AS slot{columns} "
+                    f"FROM ({self.source(ref.rule, source_fields)}) s"
                 )
         # Read each physical projection once. A UNION term per position expands
         # the same raw CTE repeatedly inside SQLite's standalone query planner.
@@ -536,7 +676,7 @@ class CorrelationCompiler:
             slots = json.dumps([slot for slot, _ in flags])
             cases = " ".join(f"WHEN {slot} THEN s.{flag}" for slot, flag in flags)
             branches.append(
-                f"SELECT 'e:' || s.eid AS eid, s.ts, s.payload, json_array(s.eid) AS evidence, "
+                f"SELECT 'e:' || s.eid AS eid, s.ts, json_array(s.eid) AS evidence, "
                 f"'[]' AS children, j.value AS slot{columns} FROM {raw} s "
                 f"JOIN {self.array_items}({literal(slots)}) j ON j.type='integer' AND CASE j.value {cases} END"
             )
@@ -795,20 +935,12 @@ class CorrelationCompiler:
             f"SELECT {keys}, metric, {', '.join(merged)} FROM {grouped} w",
         )
         group_json = json_object([(f, quote(g)) for f, g in zip(group, gs)])
-        payload = json_object(
-            [(self.field_ids[f], quote(g)) for f, g in zip(group, gs)]
-            + [
-                (self.field_ids[f], "metric")
-                for f in (kind, "sigma_metric")
-                if f in self.field_ids
-            ]
-        )
         order = ", ".join(gs + ["end", "start", "metric", "evidence"])
         node_identity = digest(rule, 16)
         result = self.add(
             stem + "_alerts",
             f"SELECT {literal('sigma_alert_' + node_identity + ':')} || ROW_NUMBER() OVER (ORDER BY {order}) AS alert_id, "
-            f"start, end, {group_json} AS group_keys, metric, evidence, children, {payload} AS payload "
+            f"start, end, {group_json} AS group_keys, metric, evidence, children{comma_groups} "
             f"FROM {combined}",
             [("end",), ("alert_id",)],
         )
@@ -821,8 +953,8 @@ class CorrelationCompiler:
         query = (
             f"SELECT alert_id, group_keys, end AS occurrence_time, start AS window_start, "
             f"end AS window_end, {literal(kind)} AS metric_name, metric AS metric_value, "
-            f"json_array_length(evidence) AS event_count, evidence AS event_ids, "
-            f"children AS child_alert_ids FROM {root} "
+            f"json_array_length(evidence) AS event_count, {public_ids('evidence')} AS event_ids, "
+            f"{public_ids('children')} AS child_alert_ids FROM {root} "
             # Alert IDs are numbered by group first; report in time order so a
             # consumer's LIMIT keeps the earliest occurrences.
             f"ORDER BY occurrence_time, alert_id"

@@ -31,6 +31,9 @@ Thresholds may be fractional (pySigma 2) and are compared exactly:
   position. Evidence includes the events and child alerts at those times for
   every successful choice. For `eq`, `neq`, `lt` and `lte`, all observed
   reference positions must occur in order and the count must pass the comparison.
+- When the threshold requires every reference, each window tracks one earliest
+  witness timestamp per position. Events tied at a witness time all contribute
+  evidence.
 - **Extended OR branches** are evaluated independently; their evidence is merged
   when they describe the same window.
 - **Absence looks forward.** In `a and not b`, an `a` event opens a window that
@@ -110,8 +113,8 @@ finer precision matters, for example to order events within one millisecond.
 ```python
 backend = sqliteBackend(
     timestamp_field="SystemTime",
-    event_id_field="row_id",      # default: SQLite rowid
-    observation_end=1704067500,   # optional absence horizon
+    event_id_field="row_id",  # default: SQLite rowid
+    observation_end=1704067500,  # optional absence horizon
 )
 backend = sqliteBackend(timestamp_field="event_time", timestamp_format="unix")
 ```
@@ -134,18 +137,18 @@ measure complete execution, including preparation.
 
 | SQLite | References / threshold | Window density | Prepare (ms) | Standalone (ms) | Plan (ms) | Alerts |
 |---|---|---|---:|---:|---:|---:|
-| 3.38.0 | 5 / 2 | Sparse | 0.81 | 2.76 | 2.62 | 38 |
-| 3.38.0 | 5 / 2 | Dense | 0.81 | 5.69 | 5.34 | 47 |
-| 3.38.0 | 12 / 6 | Sparse | 0.93 | 8.01 | 7.36 | 28 |
-| 3.38.0 | 12 / 6 | Dense | 0.92 | 19.27 | 17.73 | 43 |
-| 3.54.1 | 5 / 2 | Sparse | 0.86 | 2.59 | 2.54 | 38 |
-| 3.54.1 | 5 / 2 | Dense | 0.83 | 5.29 | 5.27 | 47 |
-| 3.54.1 | 12 / 6 | Sparse | 0.94 | 7.31 | 6.86 | 28 |
-| 3.54.1 | 12 / 6 | Dense | 0.92 | 17.30 | 16.37 | 43 |
+| 3.38.0 | 5 / 2 | Sparse | 0.79 | 2.59 | 2.37 | 38 |
+| 3.38.0 | 5 / 2 | Dense | 0.79 | 5.37 | 4.94 | 47 |
+| 3.38.0 | 12 / 6 | Sparse | 0.87 | 7.57 | 6.80 | 28 |
+| 3.38.0 | 12 / 6 | Dense | 0.87 | 18.25 | 16.47 | 43 |
+| 3.54.1 | 5 / 2 | Sparse | 0.83 | 2.47 | 2.26 | 38 |
+| 3.54.1 | 5 / 2 | Dense | 0.79 | 4.97 | 4.82 | 47 |
+| 3.54.1 | 12 / 6 | Sparse | 0.89 | 6.90 | 6.27 | 28 |
+| 3.54.1 | 12 / 6 | Dense | 0.88 | 16.45 | 15.13 | 43 |
 
 On baseline `e37c71c`, the five-reference SQL was 24,129 bytes and the plan
 had 59 stages. The twelve-reference SQL was 4,170,906 bytes and the plan had
-8,325 stages. The bounded search emits 4,485 and 4,875 bytes respectively and
+8,325 stages. The bounded search emits 4,866 and 5,256 bytes respectively and
 uses 12 stages in both cases. It retains each reachable window, reference,
 timestamp and prefix length once. More matching timestamps in a dense window
 still increase preparation and evidence costs.

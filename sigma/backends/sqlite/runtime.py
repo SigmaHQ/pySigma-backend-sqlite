@@ -4,21 +4,40 @@ import json
 import re
 import sqlite3
 from collections import Counter
+from string import ascii_lowercase, ascii_uppercase
 
 from .cidr import CIDR_FUNCTION
 from .cidr import register_cidr as register_cidr
-from .correlation import BARE_NAME, FULLTEXT_REPRESENTATION, json_array_function, quote
+from .correlation import (
+    BARE_NAME,
+    FULLTEXT_REPRESENTATION,
+    json_array_function,
+    protect_json_text,
+    quote,
+    restore_text,
+)
 from .strict import PRESENCE_REPRESENTATION
 from .strict import register_sqlite_functions as register_sqlite_functions
 
 _NAME = rf"(?:{BARE_NAME}|`(?:[^`]|``)+`)"
 _TABLE_NAME = re.compile(rf"{_NAME}(?:\.{_NAME})?\Z")
+_ASCII_LOWER = str.maketrans(ascii_uppercase, ascii_lowercase)
+
+
+def _identifier(name):
+    """SQLite folds only ASCII letters when resolving column names."""
+    return name.translate(_ASCII_LOWER)
+
+
+def _result_text(value):
+    """Decode runtime-owned TEXT on connections using text_factory=bytes."""
+    return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
 def _columns(connection, table):
     """Lowercased column names of a table."""
     cursor = connection.execute(f"SELECT * FROM {table} LIMIT 0")
-    columns = {column[0].lower() for column in cursor.description}
+    columns = {_identifier(column[0]) for column in cursor.description}
     cursor.close()
     return columns
 
@@ -81,7 +100,7 @@ def validate_fulltext(connection, requirements):
             )
         table, field = item["table"], item["field"]
         try:
-            if field.lower() not in _columns(connection, table):
+            if _identifier(field) not in _columns(connection, table):
                 raise ValueError(
                     f"Keyword text column {field!r} is missing from {table}; re-ingest events"
                 )
@@ -117,16 +136,19 @@ def validate_presence(connection, requirements):
             raise ValueError("Invalid presence requirement")
         table, field = item["table"], item["field"]
         try:
-            if field.lower() not in _columns(connection, table):
+            if _identifier(field) not in _columns(connection, table):
                 raise ValueError(
                     f"Missing presence column {table}.{field}; re-ingest events"
                 )
-            cursor = connection.execute(f"SELECT {quote(field)} FROM {table}")
+            column = quote(field)
+            cursor = connection.execute(
+                f"SELECT CASE WHEN typeof({column})='text' THEN {column} END FROM {table}"
+            )
             try:
                 for (source,) in cursor:
-                    if not isinstance(source, str):
+                    if source is None:
                         raise ValueError("expected TEXT")
-                    keys = json.loads(source)
+                    keys = json.loads(_result_text(source))
                     if not isinstance(keys, list) or any(
                         not isinstance(key, str) or not key or "\x00" in key
                         for key in keys
@@ -175,11 +197,12 @@ def ensure_fields(connection, requirements):
     for table, fields in requirements.items():
         existing = _columns(connection, table)
         for field in fields:
-            if field.lower() not in existing and field.lower() != "rowid":
+            name = _identifier(field)
+            if name not in existing and name != "rowid":
                 connection.execute(
                     f"ALTER TABLE {table} ADD COLUMN {quote(field)} TEXT COLLATE NOCASE"
                 ).close()
-                existing.add(field.lower())
+                existing.add(name)
 
 
 def execute_plan(
@@ -226,13 +249,13 @@ def execute_plan(
         diagnostics = Counter()
         if plan["diagnostics"]:
             for reason, count in connection.execute(plan["diagnostics"]):
-                diagnostics[reason] += count
+                diagnostics[_result_text(reason)] += count
         sql = plan["query"]
         if limit is not None:
             sql += f" LIMIT {int(limit) + 1}"
         cursor = connection.execute(sql)
         columns = [d[0] for d in cursor.description]
-        rows = [dict(zip(columns, row)) for row in cursor]
+        rows = [dict(zip(columns, map(_result_text, row))) for row in cursor]
         cursor.close()
         for row in rows:
             for field in ("group_keys", "event_ids", "child_alert_ids"):
@@ -241,7 +264,7 @@ def execute_plan(
             internal_fields = {}
             for item in plan.get("fulltext", []) + plan.get("presence", []):
                 internal_fields.setdefault(item["table"], set()).add(
-                    item["field"].lower()
+                    _identifier(item["field"])
                 )
             evidence = {}
             ids_by_table = {}
@@ -258,12 +281,12 @@ def execute_plan(
                 cursor = connection.execute(
                     f"SELECT CAST({event_field} AS TEXT), * FROM {table} "
                     f"WHERE CAST({event_field} AS TEXT) IN "
-                    f"(SELECT value FROM {array_items}(?) WHERE type='text')",
+                    f"(SELECT {restore_text('value')} FROM {array_items}({protect_json_text('?')}) WHERE type='text')",
                     (json.dumps(sorted(ids)),),
                 )
                 columns = [d[0] for d in cursor.description][1:]
                 for event in cursor:
-                    identity = table_id + ":" + event[0]
+                    identity = table_id + ":" + _result_text(event[0])
                     evidence[identity] = {
                         "event_id": identity,
                         "source_table": table,
@@ -271,7 +294,7 @@ def execute_plan(
                             k: v
                             for k, v in zip(columns, event[1:])
                             if v is not None
-                            and k.lower() not in internal_fields.get(table, ())
+                            and _identifier(k) not in internal_fields.get(table, ())
                         },
                     }
                 cursor.close()

@@ -30,6 +30,12 @@ The structured conversion callback may return the original query or drop it by
 returning `None`. Substituting a different detection or correlation SQL string
 raises a conversion error because the recorded field requirements and stages
 describe the original query. The plain SQL format accepts replacement strings.
+When a parent references a replaced correlation, it consumes the rows returned
+by the callback's SELECT. The parent reads `alert_id`, `occurrence_time`,
+`metric_value`, `event_ids`, and, for grouped rules, `group_keys`.
+Returning `f"SELECT * FROM ({sql}) WHERE metric_value >= 2"`
+filters the child alerts available to the parent. Keep event IDs in the child's
+source-table numbering. The compiler maps those IDs to the parent's tables.
 
 Channel and EventID allow-lists assume the Zircolite event model, with
 case-insensitive channel comparison and integer event identifiers. Set
@@ -106,9 +112,13 @@ Capture the list before widening absent fields to NULL. A database containing
 only the widened columns requires the original source keys or re-ingestion.
 `validate_entry` and `execute_plan` scan every declared presence column and
 reject missing columns and malformed rows before widening the schema.
+`exists` scans the array by index with `json_extract`, so event tables can
+use the names `json_each` and `json_tree`.
 `execute_plan` omits the internal presence and fulltext columns from the
-corresponding source table's evidence. The event query's `SELECT *` returns
-the source table's columns.
+corresponding source table's evidence using SQLite's ASCII-only identifier
+folding. With `connection.text_factory = bytes`, source TEXT values in evidence
+are bytes and alert identifiers are strings. The event query's `SELECT *`
+returns the source table's columns.
 
 ### Measured cost on a disposable table
 
@@ -121,18 +131,18 @@ with presence. The table below reports median wall time in milliseconds.
 
 | Operation | SQLite 3.38.0 | SQLite 3.54.1 |
 |---|---:|---:|
-| Ingest flattened rows | 29.0 | 30.1 |
-| Ingest with presence capture | 64.9 | 65.3 |
-| Portable literal equality, NOCASE index | 0.20 | 0.20 |
-| Unicode literal equality, same index available | 7.99 | 8.16 |
-| Validate presence on every row | 26.49 | 26.54 |
-| Retrieve all rows with `opt` present, including NULL | 14.81 | 12.68 |
+| Ingest flattened rows | 28.4 | 28.1 |
+| Ingest with presence capture | 60.3 | 62.1 |
+| Portable literal equality, NOCASE index | 0.18 | 0.16 |
+| Unicode literal equality, same index available | 7.50 | 7.65 |
+| Validate presence on every row | 26.54 | 26.90 |
+| Retrieve all rows with `opt` present, including NULL | 23.15 | 23.56 |
 
 The emitted equality selects returned the same 200 event IDs. On both engines
 `EXPLAIN QUERY PLAN` reported an index search for portable equality, a table
-scan for Unicode equality, and a table scan plus a JSON virtual-table lookup
-for source-aware existence. Before indexing, portable equality took 0.83 and
-0.81 ms respectively. The flattened NULL test returned 5,000 rows and the
+scan for Unicode equality, and a table scan plus a recursive lookup
+for source-aware existence. Before indexing, portable equality took 0.80 and
+0.73 ms respectively. The flattened NULL test returned 5,000 rows and the
 source-aware test returned 10,000, matching the ingested keys.
 
 Correlation execution uses SQLite JSON virtual tables. A source named

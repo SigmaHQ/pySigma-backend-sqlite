@@ -305,3 +305,93 @@ def test_presence_correlation_runs_on_tables_named_like_json_functions(table):
         assert json.loads(
             row[[c[0] for c in cursor.description].index("event_ids")]
         ) == ["0:1", "0:2"]
+
+
+def test_presence_works_with_both_json_table_names_shadowed():
+    entry = entry_for({"User|exists": True}, presence_field="keys")
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(keys TEXT)")
+        db.execute("CREATE TABLE json_each(x)")
+        db.execute("CREATE TEMP TABLE json_tree(x)")
+        db.executemany(
+            "INSERT INTO logs VALUES (?)", [('["user"]',), ('["a","User"]',)]
+        )
+        runtime.validate_entry(db, entry)
+        assert db.execute(entry["rule"][0]).fetchall() == [('["a","User"]',)]
+
+
+def test_presence_and_json_each_on_different_correlation_sources():
+    first = detection()
+    first["detection"]["s"] = {"x|exists": True}
+    pipe = ProcessingPipeline.from_yaml("""
+transformations:
+  - type: set_state
+    key: table
+    val: json_each
+    rule_conditions:
+      - type: rule_attribute
+        attribute: title
+        value: b
+""")
+    (entry,) = compile_docs(
+        [first, detection("b", 2), correlation("temporal", refs=["a", "b"])],
+        processing_pipeline=pipe,
+        presence_field="keys",
+        timestamp_format="unix",
+    )
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(timestamp, Host, keys)")
+        db.execute("""INSERT INTO logs VALUES(1,'host','["x"]')""")
+        db.execute("CREATE TABLE json_each(timestamp, Host, EventID)")
+        db.execute("INSERT INTO json_each VALUES(2,'host',2)")
+        cursor = db.execute(entry["rule"][0])
+        assert json.loads(cursor.fetchone()[8]) == ["0:1", "1:1"]
+        rows, _ = runtime.execute_plan(db, entry["correlation_plan"])
+        assert [row["event_ids"] for row in rows] == [["0:1", "1:1"]]
+
+
+def test_presence_on_bytes_connection_preserves_source_values_and_evidence_ids():
+    base = detection()
+    base["detection"]["s"] = {"x|exists": True}
+    (entry,) = compile_docs(
+        [base, correlation(condition={"gte": 1})],
+        presence_field="keys",
+        event_id_field="id",
+        timestamp_format="unix",
+    )
+    with sqlite3.connect(":memory:") as db:
+        db.text_factory = bytes
+        db.execute("CREATE TABLE logs(id, timestamp, Host, keys TEXT)")
+        db.execute("""INSERT INTO logs VALUES('é:1',1,'host','["x"]')""")
+        runtime.validate_entry(db, entry)
+        rows, _ = runtime.execute_plan(db, entry["correlation_plan"])
+        assert rows[0]["metric_name"] == "event_count"
+        assert rows[0]["evidence"] == [
+            {
+                "event_id": "0:é:1",
+                "source_table": "logs",
+                "event": {"id": "é:1".encode(), "timestamp": 1, "Host": b"host"},
+            }
+        ]
+        db.execute("UPDATE logs SET keys = CAST(keys AS BLOB)")
+        with pytest.raises(ValueError, match="expected TEXT"):
+            runtime.validate_entry(db, entry)
+
+
+def test_evidence_retains_sqlite_distinct_unicode_column():
+    base = detection()
+    base["detection"]["s"] = {"x|exists": True}
+    (entry,) = compile_docs(
+        [base, correlation(condition={"gte": 1})],
+        presence_field="keys",
+        timestamp_format="unix",
+    )
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(timestamp, Host, KEYS TEXT, Keys TEXT)")
+        db.execute("""INSERT INTO logs VALUES(1,'host','["x"]','source value')""")
+        rows, _ = runtime.execute_plan(db, entry["correlation_plan"])
+        assert rows[0]["evidence"][0]["event"] == {
+            "timestamp": 1,
+            "Host": "host",
+            "Keys": "source value",
+        }

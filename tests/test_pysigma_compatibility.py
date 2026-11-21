@@ -11,6 +11,7 @@ from sigma.collection import SigmaCollection
 from sigma.exceptions import SigmaModifiedError, SigmaRegularExpressionError
 from sigma.filters import SigmaFilter
 from sigma.policy.profiles import TrustedPolicy
+from sigma.processing.pipeline import ProcessingPipeline
 
 from sigma.backends.sqlite import sqliteBackend
 
@@ -115,10 +116,10 @@ def test_excessive_windash_expansion_is_not_silently_converted(field):
 
 
 @pytest.mark.parametrize("field", ["message", ""])
-@pytest.mark.parametrize("cased", [False, True])
+@pytest.mark.parametrize("modifiers", ["windash", "windash|cased", "cased|windash"])
 @pytest.mark.parametrize("dash", list("-/–—―"))
-def test_windash_accepts_each_spelling_in_rule_and_event(field, cased, dash):
-    key = f"{field}|windash" + ("|cased" if cased else "")
+def test_windash_accepts_each_spelling_in_rule_and_event(field, modifiers, dash):
+    key = f"{field}|{modifiers}"
     rules = SigmaCollection.from_dicts([rule({key: dash + "a-b"})])
     sql = sqliteBackend(fulltext_field="message").convert(rules)[0]
     samples = [prefix + "a" + inner + "b" for prefix in "-/–—―" for inner in "-/–—―"]
@@ -128,7 +129,7 @@ def test_windash_accepts_each_spelling_in_rule_and_event(field, cased, dash):
             "INSERT INTO logs VALUES (?)", [(s,) for s in [*samples, "-A-B", "xx"]]
         )
         assert [s for (s,) in db.execute(sql)] == (
-            samples if cased else samples + ["-A-B"]
+            samples if "cased" in modifiers else samples + ["-A-B"]
         )
 
 
@@ -314,3 +315,30 @@ def test_bounded_regex_preserves_authored_inline_flags_and_comments():
         db.execute("CREATE TABLE logs(v TEXT)")
         db.executemany("INSERT INTO logs VALUES (?)", [("ABb",), ("ac",), ("xac",)])
         assert db.execute(sql).fetchall() == [("ABb",), ("ac",)]
+
+
+@pytest.mark.parametrize("attempts", [1, 2])
+@pytest.mark.parametrize(
+    "boundary,expected",
+    [("startswith", ["HELLOx", "bye"]), ("endswith", ["xHELLO", "bye"])],
+)
+def test_bounded_regex_survives_placeholder_expansion(boundary, expected, attempts):
+    rules = SigmaCollection.from_dicts(
+        [rule({f"v|re|i|expand|{boundary}": "%needle%"})]
+    )
+    pipeline = ProcessingPipeline.from_dict(
+        {
+            "vars": {"needle": ["hello", "bye"]},
+            "transformations": [{"type": "value_placeholders"}],
+        }
+    )
+    backend = sqliteBackend(pipeline)
+    for _ in range(attempts):
+        (sql,) = backend.convert(rules)
+    with sqlite3.connect(":memory:") as db:
+        db.create_function("regexp", 2, regexp)
+        db.execute("CREATE TABLE logs(v TEXT)")
+        db.executemany(
+            "INSERT INTO logs VALUES (?)", [("xHELLO",), ("HELLOx",), ("bye",)]
+        )
+        assert [v for (v,) in db.execute(sql)] == expected

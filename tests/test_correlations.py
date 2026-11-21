@@ -455,6 +455,32 @@ def test_ordered_twelve_references_and_half_threshold(materialized):
         )
 
 
+@pytest.mark.parametrize("condition", [None, {"gt": 1.5}, {"eq": 2}])
+def test_full_order_dense_windows_bound_intermediate_rows(condition):
+    docs = [
+        detection(),
+        detection("b", 2),
+        correlation("temporal_ordered", ("a", "b"), condition),
+    ]
+    backend = sqliteBackend(event_id_field="row_id")
+    (entry,) = json.loads(
+        backend.convert(SigmaCollection.from_dicts(docs), "zircolite")
+    )
+    plan = entry["correlation_plan"]
+    events = [event(i / 100, EventID=1 + i % 2) for i in range(64)]
+    with database(events) as db:
+        standalone = db.execute(entry["rule"][0]).fetchall()
+        for stage in plan["prepare"]:
+            name = stage["name"]
+            db.execute(f"CREATE TEMP TABLE {name} AS {stage['select']}")
+            (size,) = db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()
+            # Each window needs at most one witness time per reference.
+            assert size <= 2 * len(events), name
+        assert db.execute(plan["query"]).fetchall() == standalone
+    assert len(standalone) == len(events) - 1
+    assert all(json.loads(row[-2]) == ["0:1", "0:2"] for row in standalone)
+
+
 @pytest.mark.parametrize("materialized", [False, True])
 def test_wide_ordered_rule_on_one_source(materialized):
     names = [f"r{i}" for i in range(48)]
@@ -778,6 +804,82 @@ def test_group_by_wider_than_one_json_object(materialized):
         keys = json.loads(con.execute(entry["rule"][0]).fetchone()[1])
     con.close()
     assert keys == {field: field.lower() for field in fields}
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("sum_mode", ["portable", "exact"])
+def test_sum_excludes_nul_terminated_numbers_from_child_evidence(
+    materialized, sum_mode
+):
+    docs = [
+        detection(),
+        correlation(name="child", condition={"gte": 1}),
+        correlation("value_sum", ("child",), {"gte": 1, "field": "Bytes"}),
+    ]
+    rows = execute(
+        docs,
+        [event(0, Bytes="12\x00junk"), event(20, Bytes="7")],
+        sum_mode=sum_mode,
+        materialized=materialized,
+    )
+    assert [(r["metric_value"], r["event_ids"]) for r in rows] == [(7, ["0:2"])]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_unicode_tuple_and_chained_group_preserve_nul_suffix(materialized):
+    child = correlation(
+        "value_count",
+        condition={"field": ["User", "OtherUser"], "eq": 2},
+        name="child",
+        generate=True,
+    )
+    events = [
+        event(0, Host="H\x00West", User="A\x00B"),
+        event(0, Host="H\x00West", User="a\x00c"),
+        event(0, Host="H\x00East", User="A\x00B"),
+    ]
+    for docs in (
+        [detection(), child],
+        [detection(), child, correlation(refs=("child",), condition={"gte": 1})],
+    ):
+        rows = execute(docs, events, text_mode="unicode", materialized=materialized)
+        assert [(r["group_keys"], r["event_ids"]) for r in rows] == [
+            ({"Host": "h\x00west"}, ["0:1", "0:2"])
+        ]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_absence_context_requires_an_observed_group(materialized):
+    docs = [
+        detection(),
+        correlation(name="child"),
+        correlation(
+            "temporal", ("child",), "not child", **{"group-by": ["sigma_metric"]}
+        ),
+    ]
+    # Raw events have no child metric with which to establish an absence window.
+    assert execute(docs, [event(0), event(5)], materialized=materialized) == []
+
+
+def test_nul_event_ids_remain_distinct_through_a_chain_and_evidence_lookup():
+    docs = [
+        detection(),
+        correlation(name="child"),
+        correlation("value_sum", ("child",), {"gte": 1, "field": "Bytes"}),
+    ]
+    (entry,) = json.loads(
+        sqliteBackend(event_id_field="User").convert(
+            SigmaCollection.from_dicts(docs), "zircolite"
+        )
+    )
+    ids = ["a\x00b", "a\x00c", "a\x011", r"a\u0000"]
+    with database([event(0, User=key) for key in ids]) as db:
+        (row,) = db.execute(entry["rule"][0]).fetchall()
+        expected = ["0:" + key for key in ids]
+        assert json.loads(row[8]) == expected
+        (alert,), _ = execute_plan(db, entry["correlation_plan"])
+        assert alert["event_count"] == len(ids)
+        assert [e["event"]["User"] for e in alert["evidence"]] == ids
 
 
 def test_shared_child_correlation_is_compiled_once():

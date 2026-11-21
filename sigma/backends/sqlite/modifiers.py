@@ -13,7 +13,6 @@ from sigma.modifiers import (
 )
 from sigma.processing.transformations.base import DetectionItemTransformation
 from sigma.types import (
-    SigmaCasedString,
     SigmaExpansion,
     SigmaRegularExpression,
     SigmaString,
@@ -42,13 +41,7 @@ class _WindowsDash(SigmaWindowsDashModifier):
                             source=self.source,
                         )
                     choices = list("-/–—―")
-                alternatives = [
-                    prefix + SigmaString.from_str(s)
-                    for prefix in alternatives
-                    for s in choices
-                ]
-        if isinstance(val, SigmaCasedString):
-            alternatives = [SigmaCasedString.from_sigma_string(s) for s in alternatives]
+                alternatives = [prefix + s for prefix in alternatives for s in choices]
         return SigmaExpansion(alternatives)
 
 
@@ -56,6 +49,12 @@ class _WindowsDash(SigmaWindowsDashModifier):
 class BoundedRegex(SigmaRegularExpression):
     anchor_start: bool = False
     anchor_end: bool = False
+
+    def replace_placeholders(self, callback):
+        return [
+            replace(self, regexp_init=pattern)
+            for pattern in self.regexp.replace_placeholders(callback)
+        ]
 
     def bound(self, pattern: str) -> str:
         # Preserve leading flag groups in front of our wrapper. In verbose mode
@@ -91,7 +90,11 @@ class SQLiteModifiers(DetectionItemTransformation):
         anchored = SigmaRegularExpressionModifier in modifiers and (
             SigmaStartswithModifier in modifiers or SigmaEndswithModifier in modifiers
         )
-        if item.original_value is None or not (windash or anchored):
+        if not (windash or anchored) or item.original_value is None:
+            return
+        # A pySigma value transformation can replace original_value with its
+        # typed results. Those values have already passed through the modifiers.
+        if not all(isinstance(v, SigmaString) for v in item.original_value):
             return
         # Replay the original sequence before user transformations. Keep the
         # rule's public modifier names and the original value for serialization.
