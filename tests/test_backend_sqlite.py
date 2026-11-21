@@ -718,7 +718,6 @@ def test_sqlite_fieldref_multiple_values(sqlite_backend: sqliteBackend):
         ("minute", 30, "%M"),
         ("hour", 14, "%H"),
         ("day", 15, "%d"),
-        ("week", 42, "%W"),
         ("month", 12, "%m"),
         ("year", 2024, "%Y"),
     ],

@@ -25,6 +25,7 @@ from sigma.exceptions import (
     SigmaError,
     SigmaFeatureNotSupportedByBackendError,
 )
+from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
 from sigma.rule import SigmaRule
 from sigma.types import (
     SigmaCasedString,
@@ -49,6 +50,7 @@ from .correlation import (
     numeric,
     quote,
 )
+from .modifiers import BoundedRegex, SQLiteModifiers
 
 _SQLITE_KEYWORDS = set(
     "ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE AND AS ASC ATTACH AUTOINCREMENT BEFORE BEGIN BETWEEN BY CASCADE CASE CAST CHECK COLLATE COLUMN COMMIT CONFLICT CONSTRAINT CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFAULT DEFERRABLE DEFERRED DELETE DESC DETACH DISTINCT DO DROP EACH ELSE END ESCAPE EXCEPT EXCLUDE EXCLUSIVE EXISTS EXPLAIN FAIL FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GENERATED GLOB GROUP GROUPS HAVING IF IGNORE IMMEDIATE IN INDEX INDEXED INITIALLY INNER INSERT INSTEAD INTERSECT INTO IS ISNULL JOIN KEY LAST LEFT LIKE LIMIT MATCH MATERIALIZED NATURAL NO NOT NOTHING NOTNULL NULL NULLS OF OFFSET ON OR ORDER OTHERS OUTER OVER PARTITION PLAN PRAGMA PRECEDING PRIMARY QUERY RAISE RANGE RECURSIVE REFERENCES REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SAVEPOINT SELECT SET TABLE TEMP TEMPORARY THEN TIES TO TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE UPDATE USING VACUUM VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHOUT".split()
@@ -96,6 +98,10 @@ class sqliteBackend(TextQueryBackend):
     correlation_methods: ClassVar[dict[str, str]] = {
         "default": "Default SQLite correlation using subqueries and window functions",
     }
+
+    backend_processing_pipeline = ProcessingPipeline(
+        items=[ProcessingItem(SQLiteModifiers())]
+    )
 
     parenthesize: bool = True
     group_expression: ClassVar[str] = "({expr})"
@@ -235,6 +241,7 @@ class sqliteBackend(TextQueryBackend):
     table = "logs"
     timestamp_field = "timestamp"
     event_id_field = "rowid"
+    week_mode = "iso"
     timestamp_format = "iso"
     observation_end = None
     cidr_mode = "expanded"
@@ -255,6 +262,7 @@ class sqliteBackend(TextQueryBackend):
             "observation_end",
             "timestamp_seconds_expression",
             "timestamp_format",
+            "week_mode",
             "collate_nocase",
             "max_flat_operands",
             "fulltext_field",
@@ -281,6 +289,8 @@ class sqliteBackend(TextQueryBackend):
             setattr(self, key, value)
         if self.cidr_mode not in ("expanded", "exact"):
             raise ValueError("cidr_mode must be expanded or exact")
+        if self.week_mode not in ("iso", "legacy"):
+            raise ValueError("week_mode must be iso or legacy")
         if self.timestamp_format not in ("iso", "unix", "unix_ms", "unix_us"):
             raise ValueError("timestamp_format must be iso, unix, unix_ms or unix_us")
         if (
@@ -627,6 +637,27 @@ class sqliteBackend(TextQueryBackend):
             + self.null_safe_expression.format(expr=expr)
         )
 
+    def convert_condition_field_eq_val_timestamp_part(self, cond, state):
+        if cond.value.timestamp_part == TimestampPart.WEEK and self.week_mode == "iso":
+            field = self.escape_and_quote_field(cond.field)
+            # Thursday belongs to the ISO week-year. Its ordinal identifies the week.
+            return (
+                f"(1 + (CAST(strftime('%j', {field}, '-3 days', 'weekday 4') "
+                f"AS INTEGER) - 1) / 7)={cond.value}"
+            )
+        return super().convert_condition_field_eq_val_timestamp_part(cond, state)
+
+    def convert_condition(self, cond, state):
+        value = getattr(cond, "value", None)
+        if isinstance(value, (SigmaString, SigmaRegularExpression)) and "\x00" in str(
+            value.regexp if isinstance(value, SigmaRegularExpression) else value
+        ):
+            raise SigmaFeatureNotSupportedByBackendError(
+                "SQLite text query literals cannot contain NUL. Follow a byte encoding "
+                "such as wide with base64 or base64offset."
+            )
+        return super().convert_condition(cond, state)
+
     def convert_value_str(
         self,
         s: SigmaString,
@@ -687,7 +718,10 @@ class sqliteBackend(TextQueryBackend):
         self, r: SigmaRegularExpression, state: ConversionState
     ) -> str:
         # Doubling single quotes is mandatory: the regex is embedded in a '...' SQL string literal.
-        return super().convert_value_re(r, state).replace("'", "''")
+        pattern = super().convert_value_re(r, state)
+        if isinstance(r, BoundedRegex):
+            pattern = r.bound(pattern)
+        return pattern.replace("'", "''")
 
     def convert_condition_field_eq_val_str(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
