@@ -82,6 +82,7 @@ option produces a warning so you can check which setting took effect.
 | `presence_field` | none | JSON array column listing the flattened fields present in each source event |
 | `sum_mode` | `portable` | Use `exact` to preserve integer window totals beyond SQLite's signed 64-bit range |
 | `week_mode` | `iso` | ISO week of year (1–53). Use `legacy` for SQLite's Monday-based week 0–53 |
+| `modifier_mode` | `sigma` | `windash` expands every dash position and `re\|startswith`/`re\|endswith` stay within the field. Use `pysigma` for pySigma's own expansion, as in 2.1 |
 | `max_flat_operands` | `100` | Longer AND/OR chains are nested to stay under SQLite's expression depth limit |
 | `cidr_mode` | `expanded` | Use portable prefix matching or opt into exact network membership with `exact` |
 | `fulltext_field` | none | Column of searchable event text; enables [keyword search](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/keyword-search.md) |

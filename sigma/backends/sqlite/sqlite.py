@@ -246,6 +246,7 @@ class sqliteBackend(TextQueryBackend):
     timestamp_field = "timestamp"
     event_id_field = "rowid"
     week_mode = "iso"
+    modifier_mode = "sigma"
     timestamp_format = "iso"
     observation_end = None
     cidr_mode = "expanded"
@@ -270,6 +271,7 @@ class sqliteBackend(TextQueryBackend):
             "timestamp_seconds_expression",
             "timestamp_format",
             "week_mode",
+            "modifier_mode",
             "collate_nocase",
             "prefilter_bounds",
             "max_flat_operands",
@@ -304,6 +306,12 @@ class sqliteBackend(TextQueryBackend):
             raise ValueError("cidr_mode must be expanded or exact")
         if self.week_mode not in ("iso", "legacy"):
             raise ValueError("week_mode must be iso or legacy")
+        if self.modifier_mode not in ("sigma", "pysigma"):
+            raise ValueError("modifier_mode must be sigma or pysigma")
+        if self.modifier_mode == "pysigma":
+            # Skip the replay of windash and re|startswith/endswith. pySigma's own
+            # expansion then stands, as in 2.1 releases of this backend.
+            self.backend_processing_pipeline = ProcessingPipeline()
         if self.text_mode not in ("portable", "unicode"):
             raise ValueError("text_mode must be portable or unicode")
         if self.sum_mode not in ("portable", "exact"):

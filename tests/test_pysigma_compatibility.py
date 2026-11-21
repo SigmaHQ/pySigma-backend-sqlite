@@ -369,3 +369,34 @@ def test_windash_beyond_three_dashes_expands_word_start_dashes(
         db.executemany("INSERT INTO logs VALUES (?)", [(matches,), (misses,), (upper,)])
         found = [v for (v,) in db.execute(sql)]
     assert found == ([matches] if "cased" in modifiers else [matches, upper])
+
+
+MODIFIER_ROWS = ["/a-b", "-a/b", "ab1", "xab1", "1ab", "1abx"]
+
+
+@pytest.mark.parametrize(
+    "selection,mode,expected",
+    [
+        ({"message|windash": "-a-b"}, "sigma", ["/a-b", "-a/b"]),
+        ({"message|windash": "-a-b"}, "pysigma", ["/a-b"]),
+        ({"message|re|startswith": "ab"}, "sigma", ["ab1"]),
+        ({"message|re|startswith": "ab"}, "pysigma", ["ab1", "xab1", "1ab", "1abx"]),
+        ({"message|re|endswith": "ab"}, "sigma", ["1ab"]),
+        ({"message|re|endswith": "ab"}, "pysigma", ["ab1", "xab1", "1ab", "1abx"]),
+    ],
+)
+def test_modifier_mode_pysigma_restores_pysigma_expansion(selection, mode, expected):
+    # pySigma expands only word-start dashes and leaves re|startswith unanchored,
+    # as 2.1 releases of this backend did.
+    rules = SigmaCollection.from_dicts([rule(selection)])
+    (sql,) = sqliteBackend(modifier_mode=mode).convert(rules)
+    with sqlite3.connect(":memory:") as db:
+        db.create_function("regexp", 2, regexp)
+        db.execute("CREATE TABLE logs(message TEXT)")
+        db.executemany("INSERT INTO logs VALUES (?)", [(v,) for v in MODIFIER_ROWS])
+        assert [v for (v,) in db.execute(sql)] == expected
+
+
+def test_modifier_mode_rejects_unknown_values():
+    with pytest.raises(ValueError, match="modifier_mode must be sigma or pysigma"):
+        sqliteBackend(modifier_mode="legacy")

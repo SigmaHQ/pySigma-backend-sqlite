@@ -144,10 +144,10 @@ with presence. The table below reports median wall time in milliseconds.
 | Portable literal equality, NOCASE index | 0.18 | 0.16 |
 | Unicode literal equality, same index available | 7.50 | 7.65 |
 | Validate presence on every row | 26.54 | 26.90 |
-| Retrieve all rows with `opt` present, including NULL | — | 8.11 |
+| Retrieve all rows with `opt` present, including NULL | 7.92 | 8.42 |
 
-The retrieval row was re-measured only on SQLite 3.54.1, with Python 3.13,
-after `exists` began using `instr`. The emitted equality selects returned the
+The retrieval row was re-measured on both engines, with Python 3.13, after
+`exists` began using `instr`. The emitted equality selects returned the
 same 200 event IDs. On both engines
 `EXPLAIN QUERY PLAN` reported an index search for portable equality, a table
 scan for Unicode equality, and a table scan plus a recursive lookup
