@@ -39,8 +39,8 @@ output before giving it 2.x rulesets.
 
 ## From 2.0 to 2.1
 
-- Requires Python 3.11+ and pySigma 2; backend 2.1.1 needs pySigma 2.0.1 or newer,
-  2.1.2 needs 2.0.3.
+- Requires Python 3.11+ and pySigma 2. Backend 2.1.1 needs pySigma 2.0.1 or newer.
+  The unpublished 2.1.2 changes used pySigma 2.0.3.
 - Keyword rules convert when `fulltext_field` is set; their entries use
   `schema_version: 3` ([keyword search](keyword-search.md)). Other output keeps
   version 2. Without it they still raise `SigmaFeatureNotSupportedByBackendError`,
@@ -52,12 +52,54 @@ output before giving it 2.x rulesets.
 - A `value_count` over a list of fields raises
   `SigmaFeatureNotSupportedByBackendError` instead of a `TypeError`.
 
-## From 2.1.1 to 2.1.2
+## From 2.1.1 to 2.2.0
 
-pySigma 2.0.3 changes the output of 2.1.2:
+Regenerate queries and rulesets from their Sigma sources. Version 2.2.0 includes
+the unpublished 2.1.2 changes and requires pySigma 2.1.0 through the latest 2.x.
+
+- Global filters with identifiers such as `_skip` now apply correctly.
+- Numeric comparison modifiers reject malformed and nonfinite input, and compare
+  numeric text by value. For example, a TEXT field holding `'2'` fails `gt: 10`.
+- Channel and EventID metadata use the shortest proven allow-list for an AND.
+  This preserves values SQLite may equate through case folding or numeric affinity.
+- Each detection entry declares only the fields and keyword text its condition
+  reads. Correlations collect prerequisites across their referenced predicates.
+- CIDR expansion remains the default. Exact IPv4 `/32` predicates use built-in
+  SQL. Other exact CIDRs require schema and plan version 4 and declare their
+  SQL function. Consumers must register it before execution and continue to
+  validate any keyword text prerequisites.
+  [CIDR examples and registration](../README.md#cidr-matching)
+
+The bundled pySigma 2.0.3 changes also affect existing portable output.
 
 - IPv6 CIDR values also match the uncompressed form Sysmon writes, such as
   `0:0:0:0:0:0:0:1` for `::1`; a filter like `not DestinationIp|cidr: ::1/128` no
   longer lets that spelling through. All 20 SigmaHQ rules with IPv6 CIDR values change.
 - Rule metadata loses control characters, line breaks included, so a multi-line
   `description` becomes one line with nothing where each break was.
+
+## Sigma 2.1 conformance changes
+
+Regenerate an existing rule containing `stamp|week: 1` to pick up ISO week
+numbering. It now includes 1 January 2025. Select `week_mode="legacy"` to
+reproduce older SQL that assigns that date to week 0. Regenerated `windash`
+and bounded regex predicates can also change matches. For example,
+`message|re|startswith: ab` matches `ab123` and excludes `xxab123`.
+
+Structured callbacks may keep or drop individual queries. A callback that
+substitutes SQL should request plain output. Derived structured entries need
+the compiler's source fields and matching execution plan.
+
+In plain output, a parent correlation now reads the rows of a referenced
+correlation whose SQL a callback replaced. Earlier releases recompiled the
+child and ignored the replacement. The parent reads `alert_id`,
+`occurrence_time`, `metric_value`, `event_ids` and, for grouped rules,
+`group_keys`. A replacement that drops or renames one of those columns makes
+the parent query fail when SQLite prepares it.
+
+With default options, existing consumers receive schema versions 2–4.
+Enabling Unicode matching, per-row presence, or exact aggregation can produce
+schema 5. Upgrade the executor before distributing those entries. Existing
+flattened event stores need a new presence column populated from their source
+records before they can distinguish missing and explicitly null fields.
+[Consumer contract](output-format.md) · [Support and examples](sigma-conformance.md)

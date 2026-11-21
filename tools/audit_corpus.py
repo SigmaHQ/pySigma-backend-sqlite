@@ -20,7 +20,9 @@ from sigma.backends.sqlite import sqliteBackend
 from sigma.backends.sqlite.runtime import (
     ensure_fields,
     execute_plan,
+    register_cidr,
     validate_fulltext,
+    validate_sql_functions,
 )
 
 KEYWORD_GAP = "Keyword search requires fulltext_field"
@@ -37,7 +39,7 @@ def failed(errors):
     )
 
 
-def audit(path, profile, *, fulltext_field=None):
+def audit(path, profile, *, fulltext_field=None, cidr_mode="expanded"):
     pipeline = None
     if profile == "windows-sysmon":
         from sigma.pipelines.sysmon import sysmon_pipeline
@@ -71,7 +73,9 @@ def audit(path, profile, *, fulltext_field=None):
             errors.append(dict(stage="parse", path=str(file), error=str(exc)))
     collection = SigmaCollection(rules)
     collection.resolve_rule_references()
-    backend = sqliteBackend(pipeline, fulltext_field=fulltext_field)
+    backend = sqliteBackend(
+        pipeline, fulltext_field=fulltext_field, cidr_mode=cidr_mode
+    )
     backend.init_processing_pipeline("zircolite")
     for rule in collection:
         title = rule.title
@@ -99,6 +103,10 @@ def audit(path, profile, *, fulltext_field=None):
                 ),
             )
             try:
+                if "required_sql_functions" in entry:
+                    register_cidr(connection)
+                    validate_sql_functions(connection, entry["required_sql_functions"])
+                    stats["exact_cidr_queries"] += len(entry["rule"])
                 connection.execute("CREATE TABLE logs(row_id INTEGER PRIMARY KEY)")
                 fulltext = entry.get("fulltext", [])
                 if fulltext:
@@ -132,6 +140,7 @@ def audit(path, profile, *, fulltext_field=None):
         counts=dict(stats),
         errors=errors,
         fulltext_field=fulltext_field,
+        cidr_mode=cidr_mode,
         sqlite_version=sqlite3.sqlite_version,
         applicability="Profile/logsource dependent; unbounded Channel does not mean inapplicable.",
         semantic_accuracy="Not measured by conversion or preparation. See execution tests and log fixtures.",
@@ -148,11 +157,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
+        "--cidr-mode", choices=["expanded", "exact"], default="expanded"
+    )
+    parser.add_argument(
         "--fulltext-field",
         help="Provision this searchable TEXT column and enable keyword conversion",
     )
     args = parser.parse_args()
-    result = audit(args.corpus, args.profile, fulltext_field=args.fulltext_field)
+    result = audit(
+        args.corpus,
+        args.profile,
+        fulltext_field=args.fulltext_field,
+        cidr_mode=args.cidr_mode,
+    )
     text = json.dumps(result, indent=2)
     if args.output:
         args.output.write_text(text + "\n")

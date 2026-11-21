@@ -1,5 +1,5 @@
 ![Tests](https://github.com/wagga40/pySigma-backend-sqlite/actions/workflows/test.yml/badge.svg)
-![Coverage Badge](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/wagga40/2ec45ded898fa11f2c42bcb9d2b163cf/raw/test.json)
+![Upstream coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/wagga40/2ec45ded898fa11f2c42bcb9d2b163cf/raw/test.json)
 
 # pySigma SQLite Backend
 
@@ -17,8 +17,8 @@ Maintained by [wagga](https://github.com/wagga40/).
 pip install pysigma-backend-sqlite
 ```
 
-Requires Python 3.11+ and [pySigma](https://github.com/SigmaHQ/pySigma) 2.0.3 or
-newer. Correlation output needs SQLite 3.38 or newer. Use sigma-cli 4.0 or newer:
+Requires Python 3.11+ and [pySigma](https://github.com/SigmaHQ/pySigma) 2.1.0 or
+newer within the 2.x series. Correlation output needs SQLite 3.38 or newer. Use sigma-cli 4.0 or newer:
 sigma-cli 3.x requires pySigma 1.x, so alongside it pip installs backend 2.0.0,
 which has no keyword search.
 
@@ -62,25 +62,38 @@ sigma convert -t sqlite -f zircolite -p sysmon -p windows-logsources rules/
 
 | Format | Output |
 |---|---|
-| `default` | One `SELECT * FROM logs WHERE ...` statement per rule |
-| `zircolite` | A JSON list with one entry per rule: Sigma metadata, the SQL, and what a consumer needs to run it. See [output format](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/output-format.md) |
+| `default` | One standalone SQL statement per detection condition or correlation |
+| `zircolite` | A JSON list with one entry per converted condition or correlation, including metadata and execution requirements. See [output format](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/output-format.md) |
 
 ## Options
 
-Pass options as constructor keywords, or from sigma-cli with `-O name=value`. Set
-them at construction; changing attributes afterwards is unsupported.
+Set options when constructing the backend or with `-O name=value` in sigma-cli.
+Changing attributes after construction is unsupported.
+Table and column names must be nonempty. pySigma also forwards options to the
+processing pipeline as `backend_<name>`. A name resembling a misspelled SQLite
+option produces a warning so you can check which setting took effect.
 
 | Option | Default | Purpose |
 |---|---|---|
 | `table` | `logs` | Table to query. A pipeline `setState` on `table` takes precedence |
 | `collate_nocase` | `false` | Emit `field='value' COLLATE NOCASE` for tables without `NOCASE` columns |
+| `prefilter_bounds` | `true` | Emit Channel/EventID allow-lists for Zircolite storage. Set to `false` for custom collations or event ID coercions |
+| `text_mode` | `portable` | Use `unicode` for Unicode case folding in detections, grouping and distinct counts |
+| `presence_field` | none | JSON array column listing the flattened fields present in each source event |
+| `sum_mode` | `portable` | Use `exact` to preserve integer window totals beyond SQLite's signed 64-bit range |
+| `week_mode` | `iso` | ISO week of year (1–53). Use `legacy` for SQLite's Monday-based week 0–53 |
 | `max_flat_operands` | `100` | Longer AND/OR chains are nested to stay under SQLite's expression depth limit |
-| `fulltext_field` | none | Column of searchable event text; enables [keyword search](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/keyword-search.md) |
+| `cidr_mode` | `expanded` | Use portable prefix matching or opt into exact network membership with `exact` |
+| `fulltext_field` | none | Column of searchable event text; enables [keyword search](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/keyword-search.md) |
 | `timestamp_field` | `timestamp` | Event time column used by correlations |
 | `timestamp_format` | `iso` | `iso`, `unix`, `unix_ms` or `unix_us` |
 | `timestamp_seconds_expression` | ISO parser | SQL turning `{field}` into Unix seconds; overrides `timestamp_format` |
 | `event_id_field` | `rowid` | Non-NULL, per-table unique event identifier for correlation evidence |
 | `observation_end` | latest event | Unix seconds up to which absence windows can expire |
+
+The optional Unicode, presence and exact-sum contracts require a consumer that
+understands schema 5. The table below describes the portable settings.
+[Sigma 2.1 feature support and parser compatibility](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/sigma-conformance.md)
 
 ## Generated SQL
 
@@ -89,15 +102,16 @@ them at construction; changing attributes afterwards is unsupported.
 | `contains`, `startswith`, `endswith` | `LIKE '%value%' ESCAPE '\'` and its prefix/suffix forms |
 | `all` | `AND` of the values |
 | `re` | `REGEXP` (needs a registered function, see [Limitations](#limitations)) |
-| `cidr` | `=` or `LIKE` prefixes of the expanded network |
+| `cidr` | Expanded mode uses `=` or `LIKE`. Exact mode uses equality for IPv4 `/32` and a registered membership function for other networks |
 | `cased` | `GLOB`; literal `*`, `?`, `[` become `[*]`, `[?]`, `[[]` |
 | `fieldref` | `field1=field2`, or `LIKE` with the second field's `%` and `_` escaped |
 | `exists` | `IS NOT NULL` / `IS NULL` |
-| `gt`, `gte`, `lt`, `lte`, `neq` | `>`, `>=`, `<`, `<=`, negated equality |
-| `minute`, `hour`, `day`, `week`, `month`, `year` | `strftime()` part |
-| `base64`, `base64offset`, `wide`, `utf16*`, `windash` | Expanded by pySigma into ordinary matches |
+| `gt`, `gte`, `lt`, `lte` | Compare finite numbers and numeric text numerically |
+| `neq` | Negated equality |
+| `minute`, `hour`, `day`, `week`, `month`, `year` | Calendar part of an ISO-8601 timestamp |
+| `base64`, `base64offset`, `wide`, `utf16be`, `utf16`, `windash` | Expanded into text predicates. Follow byte encodings with a Base64 modifier |
 
-The SQL keeps Sigma's meaning without help from the caller:
+Generated SQL handles the following cases.
 
 - **Negation.** Sigma reads a condition on a missing field as false; SQLite reads
   it as `NULL`, and `NOT NULL` drops the row. Every `NOT` therefore wraps its
@@ -107,18 +121,61 @@ The SQL keeps Sigma's meaning without help from the caller:
 - **Booleans.** `Flag: true` matches text or integer storage: `(Flag='true' OR Flag=1)`.
 - **Field names.** SQLite keywords and names with characters other than letters,
   digits and `_` are quoted with backticks. `field: null` becomes `field IS NULL`.
+- **Numeric comparisons.** `gt`, `gte`, `lt` and `lte` validate and convert the
+  stored value before comparison. A plain index on that column cannot supply a
+  range lookup for this predicate, even on an `INTEGER` column. Detections read
+  `+11`, `11.` and `011` as eleven. Numeric correlation statistics accept text
+  in JSON number syntax and skip all three spellings.
 
 ## Correlations
 
 All Sigma correlation types run in SQLite, including chains, aliases and extended
-temporal conditions. See [correlations](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/correlations.md)
-for their semantics and the [migration guide](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/migration-v2.md)
+temporal conditions. See [correlations](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/correlations.md)
+for their semantics and the [migration guide](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/migration-v2.md)
 for upgrading from backend 1.x.
+
+## CIDR matching
+
+The default `cidr_mode="expanded"` uses portable SQL. It checks the spelling of
+an address and can use SQLite prefix indexes. Exact mode parses the event value
+and tests membership in the network. For example, SQL generated for these inputs
+has the following behavior.
+
+| CIDR | Event value | Expanded | Exact |
+|---|---|---|---|
+| `10.0.0.0/8` | `10.1.2.300` | match | no match |
+| `10.0.0.0/8` | `10.1.2.3` followed by a space | match | no match |
+| `2001:db8::/32` | `2001:0db8:0:0::1` | no match | match |
+| `10.0.0.0/8` | `::ffff:10.0.0.5` (IPv4-mapped IPv6) | no match | no match |
+| `0.0.0.0/0` | `::ffff:10.0.0.5` | match | no match |
+| `::/0` | `10.0.0.5` | match | no match |
+| Either `/0` | `unknown` | match | no match |
+
+Both expanded `/0` networks compile to `LIKE '%'` and match every non-NULL
+text value. Exact mode parses the address and respects its IP family.
+
+```python
+from sigma.backends.sqlite.runtime import register_cidr
+
+register_cidr(connection)
+query = sqliteBackend(cidr_mode="exact").convert(rules)[0]
+rows = connection.execute(query).fetchall()
+```
+
+For sigma-cli, pass `-O cidr_mode=exact` and register the function on the connection
+that executes the SQL. IPv4 ranges with at least one fixed octet can use a prefix
+or equality index. When an IPv6 network fixes a nonzero first group of 16 bits,
+SQLite checks that group before parsing the address, allowing any valid letter
+case or leading zeros. This check can use a compatible index. Other IPv6
+networks skip values without a colon before parsing.
+Exact IPv4 `/32` uses a built-in SQLite comparison. Zircolite 4.7.1 can run
+these entries without registering a function. Entries that use the CIDR
+function require a schema-4 consumer. [Original CIDR report](https://github.com/SigmaHQ/pySigma-backend-sqlite/issues/17)
 
 ## Keyword search
 
 Keyword (fieldless) rules need `fulltext_field`, a column holding each event's
-searchable text. See [keyword search](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/keyword-search.md).
+searchable text. See [keyword search](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/keyword-search.md).
 
 ## Limitations
 
@@ -128,16 +185,13 @@ searchable text. See [keyword search](https://github.com/SigmaHQ/pySigma-backend
   backreferences. For trusted rules, pass `policy=TrustedPolicy` (from
   `sigma.policy.profiles`) to `SigmaCollection.from_yaml()`; the patterns must then
   suit Python's `re`.
-- **CIDR.** SQLite has no network type. Prefix patterns match IPv6 addresses only
-  in the spellings pySigma expands to: RFC 5952 and the uncompressed form Sysmon
-  writes (`0:0:0:0:0:0:0:1`), not zero-padded groups.
-- **Case folding** (`NOCASE`, `LIKE`) is ASCII only.
+- **Case folding.** Stock BINARY columns compare literal text case-sensitively. SQLite NOCASE columns or `collate_nocase=True` cover ASCII. Set `text_mode="unicode"` and register the runtime helpers for Unicode equality, wildcards, field comparisons and keywords.
 - **Timestamp parts** use `strftime()` and need ISO-8601 text; a numeric epoch is
-  read as a Julian day. `%W` can return week 0.
-- **Field existence.** SQL `NULL` cannot tell a missing field from an explicit null.
-- **Multi-field `value_count`** (a list in `condition.field`) is rejected.
+  read as a Julian day. ISO week 53 occurs in some years. Only `week_mode="legacy"` can produce week 0.
+- **Field existence.** With `presence_field`, `exists` includes an explicitly null field. The default uses SQL NULL as a proxy for absence.
+- **Multi-field `value_count`** counts distinct complete tuples in each window. A NULL component excludes that tuple from the count.
 - **Unknown columns.** A query naming a column the table lacks fails to prepare.
-  Add missing columns as `NULL` first; see [output format](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/output-format.md).
+  Add missing columns as `NULL` first; see [output format](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/output-format.md).
 
 ## Development
 
@@ -148,5 +202,12 @@ SQLITE_MIN_BINARY=/path/to/sqlite-3.38 poetry run pytest tests/test_sqlite_minim
 ```
 
 `tools/audit_corpus.py` converts and prepares a SigmaHQ checkout per profile (see
-[coverage](https://github.com/SigmaHQ/pySigma-backend-sqlite/blob/main/docs/keyword-search.md#coverage)).
+[coverage](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/keyword-search.md#coverage)).
 `tools/benchmark_correlations.py` times sparse and dense correlation windows.
+`tools/benchmark_cidr.py` compares expanded and exact event queries and
+materialized correlations over indexed and unindexed IPv4 and IPv6 data.
+It checks event and evidence identities and records SQLite query plans.
+
+```shell
+poetry run python tools/benchmark_cidr.py --size 100000 --iterations 5 --output cidr.json
+```

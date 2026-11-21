@@ -1,6 +1,8 @@
 """Execute generated SQL and materialized plans; assert observable semantics."""
 
+import itertools
 import json
+import operator
 import random
 import sqlite3
 import statistics
@@ -10,7 +12,11 @@ import pytest
 import yaml
 from helpers import correlation, database, detection, event, execute
 from sigma.collection import SigmaCollection
-from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
+from sigma.exceptions import (
+    SigmaConditionError,
+    SigmaCorrelationRuleError,
+    SigmaFeatureNotSupportedByBackendError,
+)
 
 from sigma.backends.sqlite import sqliteBackend
 from sigma.backends.sqlite.runtime import execute_plan
@@ -268,13 +274,362 @@ def test_random_windows_against_python_reference(kind):
         assert row["metric_value"] == pytest.approx(expected)
 
 
-def test_multi_field_value_count_is_reported_as_unsupported():
-    corr = correlation(
-        "value_count", condition={"gte": 2, "field": ["User", "OtherUser"]}
+@pytest.mark.parametrize("materialized", [False, True])
+def test_tuple_value_count_resolves_aliases_and_excludes_incomplete_tuples(
+    materialized,
+):
+    docs = [
+        detection(),
+        detection("b", 2),
+        correlation(
+            "value_count",
+            ("a", "b"),
+            {"gte": 0, "field": ["x", "y"]},
+            aliases={
+                "x": {"a": "User", "b": "OtherUser"},
+                "y": {"a": "OtherUser", "b": "User"},
+            },
+        ),
+    ]
+    events = [
+        event(0, User="A", OtherUser="1"),
+        event(0, User="A", OtherUser="2"),
+        event(0, User="B", OtherUser="1"),
+        event(0, EventID=2, User="1", OtherUser="a"),
+        event(0, OtherUser=None),
+        event(0, Host="other", OtherUser=None),
+        event(20, User="a|b", OtherUser="c"),
+        event(20, User="a", OtherUser="b|c"),
+    ]
+    rows = execute(docs, events, materialized=materialized)
+    assert [
+        (r["group_keys"]["Host"], r["metric_value"], r["event_ids"]) for r in rows
+    ] == [
+        ("h", 3, ["0:1", "0:2", "0:3", "0:4", "0:5"]),
+        ("other", 0, ["0:6"]),
+        ("h", 2, ["0:7", "0:8"]),
+    ]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize(
+    "value", [9007199254740993, "9007199254740993", -9223372036854775808]
+)
+def test_sum_retains_signed_integers(materialized, value):
+    docs = [
+        detection(),
+        correlation("value_sum", condition={"field": "Bytes", "eq": int(value)}),
+    ]
+    rows = execute(docs, [event(0, Bytes=value)], materialized=materialized)
+    assert [r["metric_value"] for r in rows] == [int(value)]
+    assert isinstance(rows[0]["metric_value"], int)
+    if int(value) > 0:
+        docs[-1]["correlation"]["condition"] = {
+            "field": "Bytes",
+            "gt": 9007199254740992,
+        }
+        assert execute(docs, [event(0, Bytes=value)], materialized=materialized)
+        docs[-1]["correlation"]["condition"] = {
+            "field": "Bytes",
+            "eq": 9007199254740992,
+        }
+        assert not execute(docs, [event(0, Bytes=value)], materialized=materialized)
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_portable_signed_minimum_compares_beyond_int64_threshold(materialized):
+    minimum = -(2**63)
+    for op, expected in (("eq", []), ("gt", [minimum])):
+        docs = [
+            detection(),
+            correlation("value_sum", condition={"field": "Bytes", op: minimum - 1}),
+        ]
+        rows = execute(docs, [event(0, Bytes=minimum)], materialized=materialized)
+        assert [r["metric_value"] for r in rows] == expected
+
+
+def ordered_oracle(events, slots, op, threshold):
+    compare = {
+        "gt": operator.gt,
+        "gte": operator.ge,
+        "lt": operator.lt,
+        "lte": operator.le,
+        "eq": operator.eq,
+        "neq": operator.ne,
+    }[op]
+    results = {}
+    for host, end in {(h, t) for h, t, _ in events}:
+        sample = [
+            (i, t, s)
+            for i, (h, t, s) in enumerate(events, 1)
+            if h == host and end - 5 <= t <= end
+        ]
+        seen = sorted({s for _, _, s in sample})
+        if not compare(len(seen), threshold):
+            continue
+        subsets = (
+            itertools.combinations(range(slots), threshold + (op == "gt"))
+            if op in ("gt", "gte")
+            else [seen]
+        )
+        evidence = set()
+        for subset in subsets:
+            if not subset:
+                evidence.update(f"0:{i}" for i, _, _ in sample)
+                continue
+            after = -float("inf")
+            ids = []
+            for slot in subset:
+                times = [t for _, t, s in sample if s == slot and t > after]
+                if not times:
+                    break
+                after = min(times)
+                ids.extend(f"0:{i}" for i, t, s in sample if s == slot and t == after)
+            else:
+                evidence.update(ids)
+        if evidence:
+            results[host, end] = len(seen), sorted(evidence)
+    return results
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize(
+    "op,threshold",
+    [
+        ("gte", 2),
+        ("gte", 5),
+        ("gte", 0),
+        ("gt", 2),
+        ("lt", 2),
+        ("lte", 2),
+        ("eq", 2),
+        ("neq", 2),
+    ],
+)
+def test_ordered_threshold_against_exhaustive_branches(materialized, op, threshold):
+    slots = 5
+    names = [f"r{i}" for i in range(slots)]
+    events = [
+        ("a", 0, 3),
+        ("a", 1, 2),
+        ("a", 1, 1),
+        ("a", 3, 3),
+        ("a", 0, 0),
+        ("a", 2, 1),
+        ("a", 2, 1),
+        ("b", 0, 1),
+        ("b", 4, 2),
+        ("a", 8, 4),
+        ("a", 2, 2),
+        ("a", 4, 4),
+    ]
+    docs = [detection(n, i) for i, n in enumerate(names)]
+    docs.append(correlation("temporal_ordered", names, {op: threshold}))
+    rows = execute(
+        docs,
+        [event(t, Host=h, EventID=s) for h, t, s in events],
+        materialized=materialized,
     )
-    c = SigmaCollection.from_yaml(yaml.safe_dump_all([detection(), corr]))
-    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="field list"):
-        sqliteBackend().convert(c)
+    actual = {
+        (r["group_keys"]["Host"], r["occurrence_time"] - 1704067200): (
+            r["metric_value"],
+            r["event_ids"],
+        )
+        for r in rows
+    }
+    assert actual == ordered_oracle(events, slots, op, threshold)
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_ordered_twelve_references_and_half_threshold(materialized):
+    names = [f"r{i}" for i in range(12)]
+    docs = [detection(n, i) for i, n in enumerate(names)]
+    docs.append(correlation("temporal_ordered", names, {"gte": 6}, timespan="30s"))
+    rows = execute(
+        docs, [event(t, EventID=t) for t in range(12)], materialized=materialized
+    )
+    assert [r["metric_value"] for r in rows] == list(range(6, 13))
+    for row in rows:
+        assert row["event_ids"] == sorted(
+            f"0:{i + 1}" for i in range(row["metric_value"])
+        )
+
+
+@pytest.mark.parametrize("condition", [None, {"gt": 1.5}, {"eq": 2}])
+def test_full_order_dense_windows_bound_intermediate_rows(condition):
+    docs = [
+        detection(),
+        detection("b", 2),
+        correlation("temporal_ordered", ("a", "b"), condition),
+    ]
+    backend = sqliteBackend(event_id_field="row_id")
+    (entry,) = json.loads(
+        backend.convert(SigmaCollection.from_dicts(docs), "zircolite")
+    )
+    plan = entry["correlation_plan"]
+    events = [event(i / 100, EventID=1 + i % 2) for i in range(64)]
+    with database(events) as db:
+        standalone = db.execute(entry["rule"][0]).fetchall()
+        for stage in plan["prepare"]:
+            name = stage["name"]
+            db.execute(f"CREATE TEMP TABLE {name} AS {stage['select']}")
+            (size,) = db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()
+            # Each window needs at most one witness time per reference.
+            assert size <= 2 * len(events), name
+        assert db.execute(plan["query"]).fetchall() == standalone
+    assert len(standalone) == len(events) - 1
+    assert all(json.loads(row[-2]) == ["0:1", "0:2"] for row in standalone)
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_wide_ordered_rule_on_one_source(materialized):
+    names = [f"r{i}" for i in range(48)]
+    docs = [detection(n, i) for i, n in enumerate(names)]
+    docs.append(correlation("temporal_ordered", names, {"gte": 24}))
+    rows = execute(
+        docs, [event(i / 100, EventID=i) for i in range(24)], materialized=materialized
+    )
+    assert [(r["metric_value"], len(r["event_ids"])) for r in rows] == [(24, 24)]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_ordered_partial_branches_include_only_participating_child_alerts(materialized):
+    first = correlation("event_count", ("a",), {"gte": 1}, name="first")
+    parent = correlation("temporal_ordered", ("first", "b", "c"), {"gte": 2})
+    docs = [detection(), detection("b", 2), detection("c", 3), first, parent]
+    events = [event(0), event(1), event(1, EventID=2), event(2, EventID=3)]
+    rows = execute(docs, events, materialized=materialized)
+    assert rows[-1]["event_ids"] == ["0:1", "0:3", "0:4"]
+    assert len(rows[-1]["child_alert_ids"]) == 1
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_unicode_tuple_and_groups_fold_source_text(materialized):
+    docs = [
+        detection(),
+        correlation(
+            "value_count", condition={"gte": 1, "field": ["User", "OtherUser"]}
+        ),
+    ]
+    events = [
+        event(0, Host="CAFÉ", User="Straße", OtherUser="É"),
+        event(0, Host="café", User="STRASSE", OtherUser="é"),
+    ]
+    rows = execute(docs, events, materialized=materialized, text_mode="unicode")
+    assert [(r["group_keys"], r["metric_value"], r["event_ids"]) for r in rows] == [
+        ({"Host": "café"}, 1, ["0:1", "0:2"])
+    ]
+
+
+@pytest.mark.parametrize("sum_mode", ["portable", "exact"])
+@pytest.mark.parametrize("materialized", [False, True])
+def test_integer_sum_survives_overflow_elsewhere_and_window_eviction(
+    sum_mode, materialized
+):
+    largest = 2**63 - 1
+    docs = [
+        detection(),
+        correlation("value_sum", condition={"field": "Bytes", "gte": 0}),
+    ]
+    events = [
+        event(0, Bytes=largest),
+        event(1, Bytes=2),
+        event(2, Bytes=-2),
+        event(3, Bytes=0.5),
+        event(10, Bytes="9007199254740993"),
+        event(20, Bytes=None),
+        event(25, Bytes="junk"),
+    ]
+    rows = execute(docs, events, materialized=materialized, sum_mode=sum_mode)
+    totals = [r["metric_value"] for r in rows]
+    assert totals == [
+        largest,
+        str(largest + 2) if sum_mode == "exact" else float(largest + 2),
+        largest,
+        float(largest + 0.5),
+        9007199254740993,
+    ]
+    assert [type(t) for t in totals] == [
+        int,
+        str if sum_mode == "exact" else float,
+        int,
+        float,
+        int,
+    ]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_exact_wide_totals_compare_and_chain_as_integers(materialized, sign):
+    wide = sign * (2**63 + 1)
+    child = correlation(
+        "value_sum", condition={"field": "Bytes", "eq": wide}, name="wide"
+    )
+    parent = correlation("value_sum", ("wide",), {"field": "sigma_metric", "eq": wide})
+    docs = [detection(), child, parent]
+    events = [
+        event(0, Bytes=str(wide)),
+        event(10, Bytes=sign * (2**63 - 1)),
+        event(10, Bytes=sign * 2),
+    ]
+    rows = execute(docs, events, materialized=materialized, sum_mode="exact")
+    assert [(r["metric_value"], r["event_ids"]) for r in rows] == [
+        (str(wide), ["0:1"]),
+        (str(wide), ["0:2", "0:3"]),
+    ]
+    assert all(len(r["child_alert_ids"]) == 1 for r in rows)
+    docs[-1]["correlation"]["condition"]["eq"] = wide + sign
+    assert not execute(docs, events, materialized=materialized, sum_mode="exact")
+
+
+@pytest.mark.parametrize(
+    "kind, field",
+    [
+        ("value_sum", ""),
+        ("value_count", ""),
+        ("value_avg", 3),
+        ("value_median", "metric\x00bad"),
+        ("value_count", ["User", None]),
+        ("value_count", ["User", "Bytes\x00"]),
+        ("value_count", []),
+    ],
+)
+def test_bad_metric_field_does_not_abort_independent_rules(kind, field):
+    docs = [
+        detection(),
+        correlation(kind, condition={"field": field, "gt": 0}),
+        detection("independent", 2),
+    ]
+    backend = sqliteBackend(collect_errors=True)
+    entries = json.loads(backend.convert(SigmaCollection.from_dicts(docs), "zircolite"))
+    assert [e["title"] for e in entries] == ["independent"]
+    [(rule, error)] = backend.errors
+    assert rule.title == "corr"
+    assert "field" in str(error)
+
+
+def test_compound_select_limit_is_reported_during_conversion():
+    docs = [detection(), correlation("event_count", ["a"] * 501, {"gte": 2})]
+    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="500"):
+        sqliteBackend().convert(SigmaCollection.from_dicts(docs))
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_portable_chain_keeps_int64_metric_precision(materialized):
+    value = 9007199254740993
+    child = correlation(
+        "value_sum", condition={"field": "Bytes", "eq": value}, name="child"
+    )
+    parent = correlation(
+        "value_sum", ("child",), {"field": "value_sum", "gt": value - 1}
+    )
+    rows = execute(
+        [detection(), child, parent],
+        [event(0, Bytes=str(value))],
+        materialized=materialized,
+    )
+    assert [(r["metric_value"], r["event_ids"]) for r in rows] == [(value, ["0:1"])]
+    assert isinstance(rows[0]["metric_value"], int)
 
 
 def test_collect_errors_skips_only_failing_correlations():
@@ -291,12 +646,72 @@ def test_collect_errors_skips_only_failing_correlations():
     ]
     backend = sqliteBackend(collect_errors=True)
     entries = json.loads(backend.convert(SigmaCollection.from_dicts(docs), "zircolite"))
-    assert [entry["title"] for entry in entries] == ["kept"]
+    assert sorted(entry["title"] for entry in entries) == ["kept", "multi"]
     assert sorted(rule.title for rule, _ in backend.errors) == [
-        "multi",
         "search",
         "searched",
     ]
+
+
+@pytest.mark.parametrize("fulltext_field", [None, "message"])
+def test_failed_detection_reports_each_dependent_correlation(fulltext_field):
+    broken = detection("broken")
+    broken["detection"]["condition"] = "missing"
+    docs = [
+        broken,
+        correlation(refs=("broken",), name="child"),
+        correlation(refs=("child",), name="parent"),
+        detection("independent"),
+    ]
+    backend = sqliteBackend(collect_errors=True, fulltext_field=fulltext_field)
+    entries = json.loads(backend.convert(SigmaCollection.from_dicts(docs), "zircolite"))
+    assert [entry["title"] for entry in entries] == ["independent"]
+    errors = {rule.title: error for rule, error in backend.errors}
+    assert errors.keys() == {"broken", "child", "parent"}
+    assert isinstance(errors["broken"], SigmaConditionError)
+    assert "missing" in str(errors["broken"])
+    for title in ("child", "parent"):
+        assert isinstance(errors[title], SigmaCorrelationRuleError)
+        assert str(errors[title]) == (
+            f"Correlation {title!r} references 'broken', which has no compiled predicates"
+        )
+
+
+def test_failed_reconversion_invalidates_a_previous_correlation_predicate():
+    keyword = dict(detection(), detection={"k": ["needle"], "condition": "k"})
+    rules = SigmaCollection.from_dicts([keyword, correlation()])
+    assert len(sqliteBackend(fulltext_field="message").convert(rules)) == 1
+    backend = sqliteBackend(collect_errors=True)
+    assert backend.convert(rules) == []
+    assert [rule.title for rule, _ in backend.errors] == ["a", "corr"]
+    assert isinstance(backend.errors[-1][1], SigmaCorrelationRuleError)
+
+
+@pytest.mark.parametrize("result", [None, {}, " "])
+def test_correlation_requires_a_nonempty_text_predicate(result):
+    backend = sqliteBackend(collect_errors=True)
+    rules = SigmaCollection.from_dicts([detection(), correlation()])
+    assert backend.convert(rules, callback=lambda *_: result) == []
+    [(rule, error)] = backend.errors
+    assert rule.title == "corr"
+    assert isinstance(error, SigmaCorrelationRuleError)
+    assert (
+        str(error)
+        == "Correlation 'corr' references 'a', which has no compiled predicates"
+    )
+
+
+def test_correlation_requires_conversion_states_for_stored_predicates():
+    rules = SigmaCollection.from_dicts([detection(), correlation()])
+    rules.resolve_rule_references()
+    base, dependent = rules.rules
+    base.set_conversion_result(["EventID=1"])
+    with pytest.raises(SigmaCorrelationRuleError) as exc:
+        sqliteBackend().convert_correlation_rule(dependent)
+    assert (
+        str(exc.value)
+        == "Correlation 'corr' references 'a', which has no compiled predicates"
+    )
 
 
 @pytest.mark.parametrize("value", ["soon", float("inf"), float("nan")])
@@ -389,6 +804,82 @@ def test_group_by_wider_than_one_json_object(materialized):
         keys = json.loads(con.execute(entry["rule"][0]).fetchone()[1])
     con.close()
     assert keys == {field: field.lower() for field in fields}
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("sum_mode", ["portable", "exact"])
+def test_sum_excludes_nul_terminated_numbers_from_child_evidence(
+    materialized, sum_mode
+):
+    docs = [
+        detection(),
+        correlation(name="child", condition={"gte": 1}),
+        correlation("value_sum", ("child",), {"gte": 1, "field": "Bytes"}),
+    ]
+    rows = execute(
+        docs,
+        [event(0, Bytes="12\x00junk"), event(20, Bytes="7")],
+        sum_mode=sum_mode,
+        materialized=materialized,
+    )
+    assert [(r["metric_value"], r["event_ids"]) for r in rows] == [(7, ["0:2"])]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_unicode_tuple_and_chained_group_preserve_nul_suffix(materialized):
+    child = correlation(
+        "value_count",
+        condition={"field": ["User", "OtherUser"], "eq": 2},
+        name="child",
+        generate=True,
+    )
+    events = [
+        event(0, Host="H\x00West", User="A\x00B"),
+        event(0, Host="H\x00West", User="a\x00c"),
+        event(0, Host="H\x00East", User="A\x00B"),
+    ]
+    for docs in (
+        [detection(), child],
+        [detection(), child, correlation(refs=("child",), condition={"gte": 1})],
+    ):
+        rows = execute(docs, events, text_mode="unicode", materialized=materialized)
+        assert [(r["group_keys"], r["event_ids"]) for r in rows] == [
+            ({"Host": "h\x00west"}, ["0:1", "0:2"])
+        ]
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_absence_context_requires_an_observed_group(materialized):
+    docs = [
+        detection(),
+        correlation(name="child"),
+        correlation(
+            "temporal", ("child",), "not child", **{"group-by": ["sigma_metric"]}
+        ),
+    ]
+    # Raw events have no child metric with which to establish an absence window.
+    assert execute(docs, [event(0), event(5)], materialized=materialized) == []
+
+
+def test_nul_event_ids_remain_distinct_through_a_chain_and_evidence_lookup():
+    docs = [
+        detection(),
+        correlation(name="child"),
+        correlation("value_sum", ("child",), {"gte": 1, "field": "Bytes"}),
+    ]
+    (entry,) = json.loads(
+        sqliteBackend(event_id_field="User").convert(
+            SigmaCollection.from_dicts(docs), "zircolite"
+        )
+    )
+    ids = ["a\x00b", "a\x00c", "a\x011", r"a\u0000"]
+    with database([event(0, User=key) for key in ids]) as db:
+        (row,) = db.execute(entry["rule"][0]).fetchall()
+        expected = ["0:" + key for key in ids]
+        assert json.loads(row[8]) == expected
+        (alert,), _ = execute_plan(db, entry["correlation_plan"])
+        assert alert["event_count"] == len(ids)
+        assert [e["event"]["User"] for e in alert["evidence"]] == ids
 
 
 def test_shared_child_correlation_is_compiled_once():

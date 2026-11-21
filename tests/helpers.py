@@ -8,7 +8,7 @@ import yaml
 from sigma.collection import SigmaCollection
 
 from sigma.backends.sqlite import sqliteBackend
-from sigma.backends.sqlite.runtime import execute_plan
+from sigma.backends.sqlite.runtime import execute_plan, register_sqlite_functions
 
 
 def regexp(pattern, value):
@@ -75,6 +75,8 @@ def execute(docs, events, *, materialized=False, **options):
     entry = json.loads(b.convert(collection, "zircolite"))[-1]
     con = database(events)
     try:
+        if options.get("sum_mode") == "exact" or options.get("text_mode") == "unicode":
+            register_sqlite_functions(con)
         if materialized:
             rows, _ = execute_plan(con, entry["correlation_plan"])
             assert not con.execute(

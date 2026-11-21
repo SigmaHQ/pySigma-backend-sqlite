@@ -1,6 +1,9 @@
 import json
 import math
 import re
+import warnings
+from dataclasses import dataclass
+from difflib import get_close_matches
 from typing import Any, ClassVar
 
 from sigma.conditions import (
@@ -16,12 +19,19 @@ from sigma.correlations import (
     SigmaCorrelationConditionOperator,
     SigmaCorrelationRule,
 )
-from sigma.exceptions import SigmaError, SigmaFeatureNotSupportedByBackendError
+from sigma.exceptions import (
+    SigmaConfigurationError,
+    SigmaConversionError,
+    SigmaError,
+    SigmaFeatureNotSupportedByBackendError,
+)
+from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
 from sigma.rule import SigmaRule
 from sigma.types import (
     SigmaCasedString,
     SigmaCIDRExpression,
     SigmaCompareExpression,
+    SigmaExists,
     SigmaExpansion,
     SigmaFieldReference,
     SigmaNumber,
@@ -30,13 +40,20 @@ from sigma.types import (
     TimestampPart,
 )
 
+from .cidr import CIDR_FUNCTION
 from .correlation import (
     BARE_NAME,
     FULLTEXT_REPRESENTATION,
+    SQL_INFINITY,
     CorrelationCompiler,
+    ReferenceConversionError,
+    ReplacedCorrelation,
+    literal,
     numeric,
     quote,
 )
+from .modifiers import BoundedRegex, SQLiteModifiers
+from .strict import PRESENCE_REPRESENTATION
 
 _SQLITE_KEYWORDS = set(
     "ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE AND AS ASC ATTACH AUTOINCREMENT BEFORE BEGIN BETWEEN BY CASCADE CASE CAST CHECK COLLATE COLUMN COMMIT CONFLICT CONSTRAINT CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFAULT DEFERRABLE DEFERRED DELETE DESC DETACH DISTINCT DO DROP EACH ELSE END ESCAPE EXCEPT EXCLUDE EXCLUSIVE EXISTS EXPLAIN FAIL FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GENERATED GLOB GROUP GROUPS HAVING IF IGNORE IMMEDIATE IN INDEX INDEXED INITIALLY INNER INSERT INSTEAD INTERSECT INTO IS ISNULL JOIN KEY LAST LEFT LIKE LIMIT MATCH MATERIALIZED NATURAL NO NOT NOTHING NOTNULL NULL NULLS OF OFFSET ON OR ORDER OTHERS OUTER OVER PARTITION PLAN PRAGMA PRECEDING PRIMARY QUERY RAISE RANGE RECURSIVE REFERENCES REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SAVEPOINT SELECT SET TABLE TEMP TEMPORARY THEN TIES TO TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE UPDATE USING VACUUM VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHOUT".split()
@@ -60,6 +77,18 @@ def _is_keyword(cond):
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RetainedPredicate:
+    """SQL and source requirements kept on its original pySigma conversion state."""
+
+    index: int
+    sql: str
+    table: str
+    fields: list[str]
+    fulltext: list[dict]
+    replaced: bool
+
+
 class sqliteBackend(TextQueryBackend):
     """SQLite backend."""
 
@@ -72,6 +101,10 @@ class sqliteBackend(TextQueryBackend):
     correlation_methods: ClassVar[dict[str, str]] = {
         "default": "Default SQLite correlation using subqueries and window functions",
     }
+
+    backend_processing_pipeline = ProcessingPipeline(
+        items=[ProcessingItem(SQLiteModifiers())]
+    )
 
     parenthesize: bool = True
     group_expression: ClassVar[str] = "({expr})"
@@ -135,7 +168,17 @@ class sqliteBackend(TextQueryBackend):
     case_sensitive_match_expression: ClassVar[str] = "{field} GLOB {value}"
 
     # Numeric comparison operators
-    compare_op_expression: ClassVar[str] = "{field} {operator} {value}"
+    # NUMERIC affinity converts complete numeric text for the equality check;
+    # CAST alone would turn malformed text into zero. Unary + removes the
+    # column affinity without changing the stored value. CAST AS NUMERIC keeps
+    # representable integers exact, including those beyond double precision.
+    compare_op_expression: ClassVar[str] = (
+        "(CASE WHEN (typeof({field}) != 'text' OR instr({field}, char(0)) = 0) AND "
+        "+{field} = CAST({field} AS NUMERIC) AND "
+        f"CAST({{field}} AS NUMERIC) > -{SQL_INFINITY} AND "
+        f"CAST({{field}} AS NUMERIC) < {SQL_INFINITY} "
+        "THEN CAST({field} AS NUMERIC) END) {operator} {value}"
+    )
     compare_operators: ClassVar[dict[SigmaCompareExpression.CompareOperators, str]] = {
         SigmaCompareExpression.CompareOperators.LT: "<",
         SigmaCompareExpression.CompareOperators.LTE: "<=",
@@ -182,6 +225,7 @@ class sqliteBackend(TextQueryBackend):
     # NOCASE column is noise, and because forcing a collation can cost an index seek.
     # Comparisons emitted as LIKE are case-insensitive either way; |cased uses GLOB, which is
     # case-sensitive by definition and is never collated.
+    prefilter_bounds: bool = True
     collate_nocase: bool = False
     collation_expression: ClassVar[str] = "{expr} COLLATE NOCASE"
 
@@ -201,8 +245,13 @@ class sqliteBackend(TextQueryBackend):
     table = "logs"
     timestamp_field = "timestamp"
     event_id_field = "rowid"
+    week_mode = "iso"
     timestamp_format = "iso"
     observation_end = None
+    cidr_mode = "expanded"
+    text_mode = "portable"
+    sum_mode = "portable"
+    presence_field: str | None = None
     fulltext_field: str | None = None
     timestamp_seconds_expression = (
         "ROUND((julianday({field}) - 2440587.5) * 86400000) / 1000.0"
@@ -220,21 +269,45 @@ class sqliteBackend(TextQueryBackend):
             "observation_end",
             "timestamp_seconds_expression",
             "timestamp_format",
+            "week_mode",
             "collate_nocase",
+            "prefilter_bounds",
             "max_flat_operands",
             "fulltext_field",
+            "cidr_mode",
+            "text_mode",
+            "sum_mode",
+            "presence_field",
         }
+        for key in options.keys() - configurable:
+            close = get_close_matches(key, configurable, n=1, cutoff=0.8)
+            if close:
+                warnings.warn(
+                    f"Unknown SQLite option {key!r}. Did you mean {close[0]!r}? "
+                    "The supplied option is forwarded to the processing pipeline.",
+                    stacklevel=2,
+                )
         for key in configurable & options.keys():
             value = options[key]
-            if key == "collate_nocase" and isinstance(value, str):
+            if key in ("collate_nocase", "prefilter_bounds") and isinstance(value, str):
                 if value.lower() not in ("true", "false"):
-                    raise ValueError("collate_nocase must be true or false")
+                    raise ValueError(f"{key} must be true or false")
                 value = value.lower() == "true"
+            if key == "prefilter_bounds" and not isinstance(value, bool):
+                raise ValueError("prefilter_bounds must be true or false")
             if key == "max_flat_operands":
                 value = int(value)
                 if value < 2:
                     raise ValueError("max_flat_operands must be at least 2")
             setattr(self, key, value)
+        if self.cidr_mode not in ("expanded", "exact"):
+            raise ValueError("cidr_mode must be expanded or exact")
+        if self.week_mode not in ("iso", "legacy"):
+            raise ValueError("week_mode must be iso or legacy")
+        if self.text_mode not in ("portable", "unicode"):
+            raise ValueError("text_mode must be portable or unicode")
+        if self.sum_mode not in ("portable", "exact"):
+            raise ValueError("sum_mode must be portable or exact")
         if self.timestamp_format not in ("iso", "unix", "unix_ms", "unix_us"):
             raise ValueError("timestamp_format must be iso, unix, unix_ms or unix_us")
         if (
@@ -252,23 +325,163 @@ class sqliteBackend(TextQueryBackend):
                 finite = False
             if not finite:
                 raise ValueError("observation_end must be finite Unix seconds")
-        self._correlation_plans = {}
-        if self.fulltext_field is not None and (
-            not isinstance(self.fulltext_field, str) or not self.fulltext_field
+        self._quoted_table(self.table)
+        for name in (
+            "timestamp_field",
+            "event_id_field",
+            "fulltext_field",
+            "presence_field",
         ):
-            raise ValueError("fulltext_field must be a nonempty column name")
+            value = getattr(self, name)
+            if name in ("fulltext_field", "presence_field") and value is None:
+                continue
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise ValueError(f"{name} must be a nonempty column name without NUL")
+        self._correlation_plans = {}
         super().__init__(processing_pipeline, collect_errors, **options)
+
+    def resolve_presence_field(self, processing_state):
+        field = (processing_state or {}).get("presence_field", self.presence_field)
+        if field is not None and (
+            not isinstance(field, str) or not field or "\x00" in field
+        ):
+            raise SigmaFeatureNotSupportedByBackendError(
+                "presence_field must be a nonempty column name without NUL"
+            )
+        return field
+
+    def execution_contract(self, states, *, fulltext=False, extra_functions=()):
+        """Derive the smallest supported schema for these retained predicates and stages."""
+        functions = set(extra_functions)
+        presence = set()
+        uses_regex = False
+        strict = (
+            self.text_mode == "unicode"
+            or self.sum_mode == "exact"
+            or self.presence_field is not None
+        )
+        for state in states:
+            if getattr(state, "sqlite_uses_cidr", False):
+                functions.add(CIDR_FUNCTION)
+            functions.update(getattr(state, "sqlite_functions", ()))
+            uses_regex |= getattr(state, "sqlite_uses_regex", False)
+            strict |= state.processing_state.get("presence_field") is not None
+            strict |= getattr(state, "sqlite_strict_regex", False)
+            source = getattr(state, "sqlite_presence_source", None)
+            if source is not None:
+                presence.add(source)
+        if uses_regex and (strict or presence or functions - {CIDR_FUNCTION}):
+            functions.add("regexp")
+        contract = {"version": 3 if fulltext else 2}
+        if functions:
+            contract["version"] = 4 if functions == {CIDR_FUNCTION} else 5
+            contract["required_sql_functions"] = sorted(functions)
+        if presence:
+            contract["version"] = 5
+            contract["presence"] = [
+                {
+                    "table": table,
+                    "field": field,
+                    "representation": PRESENCE_REPRESENTATION,
+                }
+                for table, field in sorted(presence)
+            ]
+        return contract
+
+    @staticmethod
+    def _strict_function(state, name, *args):
+        if not hasattr(state, "sqlite_functions"):
+            state.sqlite_functions = set()
+        state.sqlite_functions.add(name)
+        return f"{name}({', '.join(args)})"
+
+    def convert_condition_field_eq_val_exists(self, cond, state):
+        field = self.resolve_presence_field(state.processing_state)
+        if field is None:
+            return super().convert_condition_field_eq_val_exists(cond, state)
+        table = self.resolve_table(state.processing_state)
+        state.sqlite_presence_source = (table, field)
+        # Read the validated array with scalar functions. Tables elsewhere on the
+        # connection may shadow either of SQLite's JSON virtual tables.
+        source = f"{table}.{quote(field)}"
+        table_name = (
+            (state.processing_state.get("table") or self.table)
+            .rsplit(".", 1)[-1]
+            .lower()
+        )
+        alias = "field_names" if table_name == "presence_keys" else "presence_keys"
+        negation = "" if cond.value.exists else "NOT "
+        walk = (
+            f"EXISTS (WITH RECURSIVE {alias}(i, key) AS ("
+            f"SELECT 0, json_extract({source}, '$[0]') UNION ALL "
+            f"SELECT i+1, json_extract({source}, '$[' || (i+1) || ']') "
+            f"FROM {alias} WHERE key IS NOT NULL) "
+            f"SELECT 1 FROM {alias} WHERE key = {literal(cond.field)} COLLATE BINARY)"
+        )
+        if not set(cond.field) - {" ", ","}:
+            # Such a name could span the separator between two elements.
+            return negation + walk
+        # Each extraction re-reads the array from its start. Without a backslash,
+        # every quote in the validated array delimits an element, so the quoted
+        # name occurs exactly when one element equals it.
+        name = literal(json.dumps(cond.field, ensure_ascii=False))
+        return (
+            f"{negation}(CASE WHEN instr({source}, '\\') = 0 "
+            f"THEN instr({source}, {name}) > 0 ELSE {walk} END)"
+        )
+
+    @staticmethod
+    def _unicode_text(guard, unicode, native):
+        # Function results carry no column affinity: 445 = '445' only holds in
+        # SQLite's own comparison. Values that are not TEXT keep that comparison.
+        return f"CASE WHEN {guard} THEN {unicode} ELSE {native} END"
 
     def convert_condition_field_eq_field(self, cond, state):
         expression = super().convert_condition_field_eq_field(cond, state)
         # Only equality is collated: the startswith/endswith forms use LIKE.
         if self.collate_nocase and not (cond.value.starts_with or cond.value.ends_with):
-            return self.collation_expression.format(expr=expression)
-        return expression
+            expression = self.collation_expression.format(expr=expression)
+        if self.text_mode != "unicode":
+            return expression
+        left, right = self.convert_condition_field_eq_field_escape_and_quote(
+            cond.field, cond.value.field
+        )
+        starts, ends = cond.value.starts_with, cond.value.ends_with
+        if not starts and not ends:
+            lhs = self._strict_function(state, "sigma_casefold", left)
+            rhs = self._strict_function(state, "sigma_casefold", right)
+            guard = f"typeof({left})='text' AND typeof({right})='text'"
+            return self._unicode_text(guard, f"{lhs}={rhs}", expression)
+        # The pattern is TEXT whatever the type of the referenced field.
+        pattern = self.field_ref_like_escape.format(field2=right)
+        if ends:
+            pattern = "'%' || " + pattern
+        if starts:
+            pattern += " || '%'"
+        unicode = self._strict_function(state, "sigma_unicode_like", left, pattern)
+        return self._unicode_text(f"typeof({left})='text'", unicode, expression)
 
     def resolve_table(self, state=None):
-        table = (state or {}).get("table") or self.table
-        # Keep simple names readable, quote every component of a qualified name.
+        table = (state or {}).get("table")
+        if table is None:
+            return self._quoted_table(self.table)
+        try:
+            return self._quoted_table(table)
+        except ValueError as error:
+            raise SigmaConfigurationError(
+                f"Invalid pipeline table override: {error}"
+            ) from error
+
+    def _quoted_table(self, table):
+        if (
+            not isinstance(table, str)
+            or "\x00" in table
+            or table.count(".") > 1
+            or not all(table.split("."))
+        ):
+            raise ValueError(
+                "table must have one or two nonempty name components without NUL"
+            )
         return ".".join(self.escape_and_quote_field(part) for part in table.split("."))
 
     def escape_and_quote_field(self, field):
@@ -282,11 +495,17 @@ class sqliteBackend(TextQueryBackend):
         field = self.escape_and_quote_field(self.timestamp_field)
         return self.timestamp_seconds_expression.format(field=field)
 
-    def required_fields(self, rule):
+    def required_fields(self, rule, index=None, state=None):
         fields = set()
-        for condition in rule.detection.parsed_condition:
+        conditions = rule.detection.parsed_condition
+        for condition in conditions if index is None else (conditions[index],):
             for cond in _walk(condition.parsed):
                 if isinstance(cond, ConditionFieldEqualsValueExpression):
+                    if isinstance(cond.value, SigmaExists) and state is not None:
+                        presence = self.resolve_presence_field(state.processing_state)
+                        if presence is not None:
+                            fields.add(presence)
+                            continue
                     if cond.field:
                         fields.add(cond.field)
                     if isinstance(cond.value, SigmaFieldReference):
@@ -295,17 +514,15 @@ class sqliteBackend(TextQueryBackend):
                     fields.add(self.fulltext_field)
         return sorted(fields)
 
-    def fulltext_requirements(self, rule, state=None):
+    def fulltext_requirements(self, rule, state=None, index=None):
         if self.fulltext_field is None:
             return []
-        if state is None:
-            states = [item.processing_state for item in rule.get_conversion_states()]
-        else:
-            states = [state] * len(rule.detection.parsed_condition)
+        conditions = rule.detection.parsed_condition
+        states = rule.get_conversion_states() if state is None else None
         tables = {
-            self.resolve_table(states[i])
-            for i, condition in enumerate(rule.detection.parsed_condition)
-            if any(map(_is_keyword, _walk(condition.parsed)))
+            self.resolve_table(states[i].processing_state if state is None else state)
+            for i in (range(len(conditions)) if index is None else (index,))
+            if any(map(_is_keyword, _walk(conditions[i].parsed)))
         }
         return [
             {
@@ -316,45 +533,143 @@ class sqliteBackend(TextQueryBackend):
             for table in sorted(tables)
         ]
 
+    def init_processing_pipeline(self, output_format=None):
+        super().init_processing_pipeline(output_format)
+        self._configured_pipeline = self.processing_pipeline
+
+    def _prepare_conversion(self, rule, output_format):
+        # Reset the previous attempt before a pipeline, callback or finalizer can fail.
+        rule.set_conversion_result([])
+        rule.set_conversion_states([])
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if (
+            pipeline is None
+            or self._configured_pipeline is not self.processing_pipeline
+            or pipeline.vars.get("output_format")
+            != (output_format or self.default_format)
+        ):
+            self.init_processing_pipeline(output_format)
+
+    def _callback_result(self, callback, rule, fmt, index, condition, predicate):
+        if callback is None:
+            return predicate
+        result = callback(rule, fmt, index, condition, predicate)
+        if (
+            (fmt or self.default_format) == "zircolite"
+            and result is not None
+            and result != predicate
+        ):
+            raise SigmaConversionError(
+                rule,
+                rule.source,
+                f"Structured output for {rule.title!r} requires callbacks to return "
+                "the original SQL or None so its execution requirements remain valid",
+            )
+        return result
+
     def convert_correlation_rule(
         self, rule, output_format=None, method=None, callback=None
     ):
-        if not hasattr(self, "last_processing_pipeline"):
-            self.init_processing_pipeline(output_format)
-        # pySigma collects errors for detection rules only.
+        self._prepare_conversion(rule, output_format)
+        # The dependency marker belongs to this attempt. An intermediate rule
+        # with generate disabled still has a successful conversion result.
+        rule._sqlite_dependency_failure = (rule.title, "failed to convert")
+        replacement = None
+
+        def select(rule, fmt, index, query, predicate):
+            nonlocal replacement
+            result = self._callback_result(callback, rule, fmt, index, query, predicate)
+            if result is not None and result != predicate:
+                replacement = ReplacedCorrelation(
+                    result, self._correlation_plans[id(rule)]["source_tables"]
+                )
+            return result
+
         try:
-            return super().convert_correlation_rule(
-                rule, output_format, method, callback
+            output = super().convert_correlation_rule(
+                rule, output_format, method, select
             )
-        except SigmaError as e:
+            if rule.get_conversion_result():
+                del rule._sqlite_dependency_failure
+                rule.get_conversion_states()[0].sqlite_replacement = replacement
+            else:
+                rule._sqlite_dependency_failure = (rule.title, "has no compiled query")
+            return output
+        except SigmaError as error:
+            if isinstance(error, ReferenceConversionError):
+                rule._sqlite_dependency_failure = (error.dependency, error.reason)
             if not self.collect_errors:
                 raise
-            self.errors.append((rule, e))
+            self.errors.append((rule, error))
             return []
+        finally:
+            # A skipped query or exception may bypass both finalizers.
+            self._correlation_plans.pop(id(rule), None)
 
     def convert_rule(self, rule, output_format=None, callback=None):
-        queries = super().convert_rule(rule, output_format, callback)
-        # pySigma stores predicates for referenced rules. generate:true must
-        # still emit finalized standalone queries without overwriting them.
-        if (
-            rule._backreferences
-            and rule._output
-            and not self.finalize_correlation_subqueries
-        ):
-            return [
-                self.finalize_query(
-                    rule,
+        self._prepare_conversion(rule, output_format)
+        selected = []
+
+        def select(rule, fmt, index, condition, predicate):
+            result = self._callback_result(
+                callback, rule, fmt, index, condition, predicate
+            )
+            if result is not None:
+                selected.append((index, result, result != predicate))
+            # Let pySigma apply its pipeline and compile every condition once.
+            # Finalize after it exposes the states, using original indices.
+            return None
+
+        error_count = len(self.errors)
+        super().convert_rule(rule, output_format, select)
+        if len(self.errors) != error_count:
+            return []
+        states = rule.get_conversion_states()
+        raw = rule._backreferences and not self.finalize_correlation_subqueries
+        try:
+            self.resolve_table(self.last_processing_pipeline.state)
+            retained = []
+            for index, query, replaced in selected:
+                state = states[index]
+                state.sqlite_predicate = RetainedPredicate(
+                    index,
                     query,
-                    i,
-                    rule.get_conversion_states()[i],
-                    output_format or self.default_format,
+                    self.resolve_table(state.processing_state),
+                    self.required_fields(rule, index, state),
+                    self.fulltext_requirements(rule, state.processing_state, index),
+                    replaced,
                 )
-                for i, query in enumerate(queries)
-            ]
-        return queries
+                retained.append(state)
+            entries = []
+            if rule._output or not raw:
+                for state in retained:
+                    predicate = state.sqlite_predicate
+                    entries.append(
+                        self.finalize_query(
+                            rule,
+                            predicate.sql,
+                            predicate.index,
+                            state,
+                            output_format or self.default_format,
+                        )
+                    )
+        except Exception as error:
+            rule.set_conversion_states([])
+            if not (self.collect_errors and isinstance(error, SigmaError)):
+                raise
+            self.errors.append((rule, error))
+            return []
+        rule.set_conversion_result(
+            [state.sqlite_predicate.sql for state in retained] if raw else entries
+        )
+        return entries if rule._output else []
 
     def convert_correlation_rule_from_template(self, rule, correlation_type, method):
-        query, plan = CorrelationCompiler(self, rule).compile()
+        self.resolve_table(self.last_processing_pipeline.state)
+        structured = (
+            self.last_processing_pipeline.vars.get("output_format") == "zircolite"
+        )
+        query, plan = CorrelationCompiler(self, rule, structured).compile()
         self._correlation_plans[id(rule)] = plan
         return [query]
 
@@ -464,6 +779,27 @@ class sqliteBackend(TextQueryBackend):
             + self.null_safe_expression.format(expr=expr)
         )
 
+    def convert_condition_field_eq_val_timestamp_part(self, cond, state):
+        if cond.value.timestamp_part == TimestampPart.WEEK and self.week_mode == "iso":
+            field = self.escape_and_quote_field(cond.field)
+            # Thursday belongs to the ISO week-year. Its ordinal identifies the week.
+            return (
+                f"(1 + (CAST(strftime('%j', {field}, '-3 days', 'weekday 4') "
+                f"AS INTEGER) - 1) / 7)={cond.value}"
+            )
+        return super().convert_condition_field_eq_val_timestamp_part(cond, state)
+
+    def convert_condition(self, cond, state):
+        value = getattr(cond, "value", None)
+        if isinstance(value, (SigmaString, SigmaRegularExpression)) and "\x00" in str(
+            value.regexp if isinstance(value, SigmaRegularExpression) else value
+        ):
+            raise SigmaFeatureNotSupportedByBackendError(
+                "SQLite text query literals cannot contain NUL. Follow a byte encoding "
+                "such as wide with base64 or base64offset."
+            )
+        return super().convert_condition(cond, state)
+
     def convert_value_str(
         self,
         s: SigmaString,
@@ -520,11 +856,26 @@ class sqliteBackend(TextQueryBackend):
             numeric_value=self.bool_numeric_values[cond.value.boolean],
         )
 
+    def _record_regex(self, state):
+        state.sqlite_uses_regex = True
+        state.sqlite_strict_regex = (
+            self.text_mode == "unicode"
+            or self.sum_mode == "exact"
+            or self.resolve_presence_field(state.processing_state) is not None
+        )
+
+    def convert_condition_field_eq_val_re(self, cond, state):
+        self._record_regex(state)
+        return super().convert_condition_field_eq_val_re(cond, state)
+
     def convert_value_re(
         self, r: SigmaRegularExpression, state: ConversionState
     ) -> str:
         # Doubling single quotes is mandatory: the regex is embedded in a '...' SQL string literal.
-        return super().convert_value_re(r, state).replace("'", "''")
+        pattern = super().convert_value_re(r, state)
+        if isinstance(r, BoundedRegex):
+            pattern = r.bound(pattern)
+        return pattern.replace("'", "''")
 
     def convert_condition_field_eq_val_str(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
@@ -541,15 +892,22 @@ class sqliteBackend(TextQueryBackend):
             char in value
             for char in (self.wildcard_multi, self.wildcard_single, self.escape_char)
         ):
-            return self.wildcard_match_expression.format(
+            expr = self.wildcard_match_expression.format(
                 field=field, value=self.convert_value_str(value, state, no_quote=True)
             )
-        expr = self.eq_expression.format(
-            field=field, value=self.convert_value_str(value, state), backend=self
+        else:
+            expr = self.eq_expression.format(
+                field=field, value=self.convert_value_str(value, state), backend=self
+            )
+            if self.collate_nocase:
+                expr = self.collation_expression.format(expr=expr)
+        if self.text_mode != "unicode":
+            return expr
+        pattern = self.convert_value_str(value, state, no_quote=True)
+        unicode = self._strict_function(
+            state, "sigma_unicode_like", field, f"'{pattern}'"
         )
-        if self.collate_nocase:
-            return self.collation_expression.format(expr=expr)
-        return expr
+        return self._unicode_text(f"typeof({field})='text'", unicode, expr)
 
     def convert_condition_field_eq_val_str_case_sensitive(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
@@ -564,7 +922,8 @@ class sqliteBackend(TextQueryBackend):
         # A CIDR expanding to several patterns converts into an OR; group it like pySigma
         # groups a SigmaExpansion, whatever selection or condition shape contains it.
         if (
-            isinstance(inner, ConditionFieldEqualsValueExpression)
+            self.cidr_mode == "expanded"
+            and isinstance(inner, ConditionFieldEqualsValueExpression)
             and isinstance(inner.value, SigmaCIDRExpression)
             and len(inner.value.expand()) > 1
         ):
@@ -576,6 +935,43 @@ class sqliteBackend(TextQueryBackend):
     ) -> str:
         """Conversion of field matches CIDR value expressions."""
         cidr: SigmaCIDRExpression = cond.value
+        if self.cidr_mode == "exact":
+            field = self.escape_and_quote_field(cond.field)
+            network = cidr.network
+            if network.version == 4 and network.prefixlen == 32:
+                # IPv4 hosts have one valid spelling. The first comparison can
+                # use the column's index. BINARY rejects collation equivalents
+                # such as trailing spaces under RTRIM. IS returns false for NULL.
+                host = literal(str(network.network_address))
+                return f"({field} IS {host} AND {field} COLLATE BINARY IS {host})"
+            state.sqlite_uses_cidr = True
+            exact = f"{CIDR_FUNCTION}({field}, {literal(str(network))})"
+            if network.version == 6:
+                hextet = network.network_address.packed[:2].hex().lstrip("0")
+                if network.prefixlen < 16 or not hextet:
+                    # A leading zero hextet can disappear into "::".
+                    return f"CASE WHEN instr({field}, ':') THEN {exact} ELSE 0 END"
+                prefixes = [hextet.zfill(n) for n in range(len(hextet), 5)]
+                if hextet.isdigit():
+                    checks = [f"{field} LIKE '{p}:%'" for p in prefixes]
+                else:
+                    # ':' and ';' are adjacent in NOCASE order. The range covers
+                    # every letter case even when LIKE is case-sensitive. The UDF
+                    # rejects the inclusive upper endpoint along with malformed IPs.
+                    checks = [
+                        f"{field} COLLATE NOCASE BETWEEN '{p}:' AND '{p};'"
+                        for p in prefixes
+                    ]
+                guard = "(" + " OR ".join(checks) + ")"
+            elif network.prefixlen < 8:
+                return exact
+            else:
+                address = str(network.network_address)
+                prefix = ".".join(address.split(".")[: network.prefixlen // 8])
+                guard = f"{field} LIKE {literal(prefix + '.%')}"
+            # The outer guard is indexable in WHERE. CASE also short-circuits the
+            # function when the same predicate is projected as a correlation flag.
+            return f"({guard} AND CASE WHEN {guard} THEN {exact} ELSE 0 END)"
         expanded_cond = ConditionOR(
             [
                 ConditionFieldEqualsValueExpression(cond.field, SigmaString(network))
@@ -619,12 +1015,33 @@ class sqliteBackend(TextQueryBackend):
             if cond.field is None or cond.field.lower() != field_name_lower:
                 return None
             value = cond.value
-            if isinstance(value, SigmaNumber):
-                return {value.number}
-            # A wildcard, regex, CIDR, comparison, field reference or existence test names no
-            # single value the rule requires.
+            if type(value) is SigmaNumber:
+                if field_name_lower == "eventid" and isinstance(value.number, int):
+                    # Larger integers may compare equal after REAL affinity rounds them.
+                    if abs(value.number) < 2**53:
+                        return {value.number}
+                return None
             if isinstance(value, SigmaString) and not value.contains_special():
-                return {str(value)}
+                # to_plain() restores Sigma wildcard escapes. SQL compares their
+                # decoded characters, which are already present in the string segments.
+                text = value.convert(escape_char=None)
+                if field_name_lower == "eventid":
+                    # Decimal/exponent spellings depend on both column affinity
+                    # and consumer coercion. Another AND operand may still bound them.
+                    digits = text.lstrip("+-")
+                    if len(digits) <= 16 and re.fullmatch(r"[+-]?[0-9]+", text):
+                        number = int(text)
+                        if abs(number) < 2**53:
+                            return {number}
+                    return None
+                if re.fullmatch(
+                    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+                    text.strip(),
+                ):
+                    # NUMERIC affinity can match another spelling of this channel.
+                    return None
+                if self.text_mode != "unicode" or isinstance(value, SigmaCasedString):
+                    return {text}
             return None
 
         if isinstance(cond, ConditionAND):
@@ -636,9 +1053,9 @@ class sqliteBackend(TextQueryBackend):
                 )
                 if bound is not None
             ]
-            if not bounds:
-                return None
-            return set.intersection(*bounds)
+            # A Python intersection can discard values equivalent under SQLite
+            # affinity or collation. Every AND operand independently bounds the result.
+            return min(bounds, key=len, default=None)
 
         if isinstance(cond, ConditionOR):
             # One unbounded branch leaves the whole disjunction unbounded.
@@ -660,6 +1077,8 @@ class sqliteBackend(TextQueryBackend):
 
         An empty list means "no provable bound" and leaves the field unfiltered downstream.
         """
+        if not self.prefilter_bounds:
+            return []
         condition = rule.detection.parsed_condition[index].parsed
         bound = self._field_value_bound(condition, field_name.lower())
         return sorted(bound, key=str) if bound else []
@@ -674,6 +1093,11 @@ class sqliteBackend(TextQueryBackend):
         if isinstance(rule, SigmaCorrelationRule):
             plan = self._correlation_plans.pop(id(rule))
             fulltext = plan.get("fulltext", [])
+            contract = {
+                key: plan[key]
+                for key in ("version", "required_sql_functions", "presence")
+                if key in plan
+            }
             channels, event_ids = [], []
             kind = {
                 # Zircolite's own converter sets this; it is what keeps a correlation rule out
@@ -686,14 +1110,16 @@ class sqliteBackend(TextQueryBackend):
                 "result_type": "correlation",
             }
         else:
-            fulltext = self.fulltext_requirements(rule, state.processing_state)
+            predicate = state.sqlite_predicate
+            fulltext = predicate.fulltext
+            contract = self.execution_contract([state], fulltext=bool(fulltext))
             # Channels and event IDs the rule's condition provably requires
             channels = self._extract_field_values_from_rule(rule, "Channel", index)
             event_ids = self._extract_field_values_from_rule(rule, "EventID", index)
             kind = {
-                "required_fields": self.required_fields(rule),
+                "required_fields": predicate.fields,
                 "result_type": "event",
-                "source_table": self.resolve_table(state.processing_state),
+                "source_table": predicate.table,
                 "logsource": {
                     key: getattr(rule.logsource, key)
                     for key in ("product", "category", "service")
@@ -719,7 +1145,8 @@ class sqliteBackend(TextQueryBackend):
         }
         if fulltext:
             zircolite_rule["fulltext"] = fulltext
-        zircolite_rule["schema_version"] = 3 if fulltext else 2
+        zircolite_rule["schema_version"] = contract.pop("version")
+        zircolite_rule.update(contract)
         return zircolite_rule
 
     def finalize_output_zircolite(self, queries: list[dict]) -> str:
@@ -759,6 +1186,10 @@ class sqliteBackend(TextQueryBackend):
         )
         if cased:
             return f"{field} GLOB '*{value}*'"
+        if self.text_mode == "unicode":
+            return self._strict_function(
+                state, "sigma_unicode_like", field, f"'%{value}%'"
+            )
         return self.contains_expression.format(field=field, value=value)
 
     def convert_condition_val_num(
@@ -773,6 +1204,7 @@ class sqliteBackend(TextQueryBackend):
         self, cond: ConditionValueExpression, state: ConversionState
     ) -> str:
         field = self._fulltext_column()
+        self._record_regex(state)
         regex = self.convert_value_re(cond.value, state)
         flags = self.get_flag_template(cond.value)
         return self.re_expression.format(field=field, regex=regex, **flags)

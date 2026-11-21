@@ -47,11 +47,23 @@ def test_max_flat_operands_option_reads_cli_strings():
         ({"max_flat_operands": "1"}, "max_flat_operands"),
         ({"timestamp_format": "epoch"}, "timestamp_format"),
         ({"fulltext_field": ""}, "fulltext_field"),
+        ({"table": ""}, "table"),
+        ({"table": "main."}, "table"),
+        ({"timestamp_field": ""}, "timestamp_field"),
+        ({"event_id_field": ""}, "event_id_field"),
     ],
 )
 def test_invalid_options_are_rejected(options, message):
     with pytest.raises(ValueError, match=message):
         sqliteBackend(**options)
+
+
+def test_misspelled_option_warns_and_is_still_available_to_pipelines():
+    with pytest.warns(UserWarning, match="cidr_mod.*cidr_mode"):
+        backend = sqliteBackend(cidr_mod="exact", tenant="example")
+    convert_selection({"field": "value"}, backend)
+    assert backend.last_processing_pipeline.vars["backend_cidr_mod"] == "exact"
+    assert backend.last_processing_pipeline.vars["backend_tenant"] == "example"
 
 
 def test_fieldref_target_is_a_required_field():
@@ -706,7 +718,6 @@ def test_sqlite_fieldref_multiple_values(sqlite_backend: sqliteBackend):
         ("minute", 30, "%M"),
         ("hour", 14, "%H"),
         ("day", 15, "%d"),
-        ("week", 42, "%W"),
         ("month", 12, "%m"),
         ("year", 2024, "%Y"),
     ],
@@ -721,13 +732,97 @@ def test_sqlite_timestamp_part(modifier, value, part):
 
 
 @pytest.mark.parametrize(
-    "modifier, value, operator",
-    [("gt", 100, ">"), ("gte", 100, ">="), ("lt", 50, "<"), ("lte", 50, "<=")],
+    "modifier, expected",
+    [("gt", [3]), ("gte", [2, 3]), ("lt", [1]), ("lte", [1, 2])],
 )
-def test_sqlite_compare(modifier, value, operator):
-    assert convert_selection({f"fieldA|{modifier}": value}) == [
-        f"SELECT * FROM logs WHERE fieldA {operator} {value}"
-    ]
+@pytest.mark.parametrize("affinity", ["TEXT COLLATE NOCASE", "NUMERIC", ""])
+def test_sqlite_compare(modifier, expected, affinity):
+    sql = convert_selection({f"fieldA|{modifier}": 10})[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute(f"CREATE TABLE logs(id INTEGER PRIMARY KEY, fieldA {affinity})")
+        db.executemany(
+            "INSERT INTO logs(fieldA) VALUES(?)",
+            [
+                ("2",),
+                ("1e1",),
+                ("20",),
+                ("unavailable",),
+                ("10px",),
+                (None,),
+                (b"99",),
+                ("1e999",),
+                (float("-inf"),),
+            ],
+        )
+        assert [row[0] for row in db.execute(sql)] == expected
+
+
+def test_numeric_comparison_preserves_integer_precision():
+    sql = convert_selection({"fieldA|gt": 2**53})[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(fieldA TEXT)")
+        db.executemany("INSERT INTO logs VALUES(?)", [(str(2**53),), (str(2**53 + 1),)])
+        assert db.execute(sql).fetchall() == [(str(2**53 + 1),)]
+
+
+@pytest.mark.parametrize(
+    ("field", "affinity", "left", "right", "extra"),
+    [
+        (
+            "Channel",
+            "TEXT COLLATE NOCASE",
+            ["Security", "Setup"],
+            ["security", "Setup"],
+            "System",
+        ),
+        ("EventID", "INTEGER", [1, 2], ["1", 2], 3),
+    ],
+)
+def test_metadata_bounds_cover_all_rows_returned_by_sql(
+    field, affinity, left, right, extra
+):
+    rule = {
+        "title": "Bounds",
+        "logsource": {"category": "test"},
+        "detection": {
+            "a": {field: left},
+            "b": {field: right},
+            "c": {field: extra},
+            "condition": "(a and b) or c",
+        },
+    }
+    entry = json.loads(
+        sqliteBackend().convert(SigmaCollection.from_dicts([rule]), "zircolite")
+    )[0]
+    with sqlite3.connect(":memory:") as db:
+        db.execute(f"CREATE TABLE logs({field} {affinity})")
+        db.executemany("INSERT INTO logs VALUES(?)", [(v,) for v in [*left, extra]])
+        results = {str(v).lower() for (v,) in db.execute(entry["rule"][0])}
+    bounds = entry[field.lower()]
+    assert results <= {str(v).lower() for v in bounds}
+
+
+@pytest.mark.parametrize(
+    ("field", "broader", "narrower"),
+    [
+        ("Channel", ["Security", "System"], ["System"]),
+        ("EventID", [12, 13, 14], [12, 13]),
+    ],
+)
+def test_and_keeps_shortest_proven_allowlist(field, broader, narrower):
+    doc = {
+        "title": "Constrained by pipeline and rule",
+        "logsource": {"category": "test"},
+        "detection": {
+            "a": {field: broader},
+            "b": {field: narrower},
+            "condition": "a and b",
+        },
+    }
+    (entry,) = json.loads(
+        sqliteBackend().convert(SigmaCollection.from_dicts([doc]), "zircolite")
+    )
+    assert entry[field.lower()] == narrower
 
 
 # ==================== All Modifier Tests ====================
@@ -1469,3 +1564,26 @@ def test_correlation_temporal_ordered_extended_condition():
             condition: rule_a and rule_b
     """
     ) == {"ordered"}
+
+
+@pytest.mark.parametrize(
+    "table,expected",
+    [
+        ("main.logs", "main.logs"),
+        ("temp.order", "`temp`.`order`"),
+        ("main.my-logs", "main.`my-logs`"),
+    ],
+)
+def test_dotted_table_quotes_only_components_that_need_it(table, expected):
+    rules = SigmaCollection.from_dicts(
+        [
+            {
+                "title": "t",
+                "logsource": {"category": "test"},
+                "detection": {"s": {"EventID": 1}, "condition": "s"},
+            }
+        ]
+    )
+    (entry,) = json.loads(sqliteBackend(table=table).convert(rules, "zircolite"))
+    assert entry["source_table"] == expected
+    assert f" FROM {expected} WHERE " in entry["rule"][0]

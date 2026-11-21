@@ -26,20 +26,36 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: poetry install
+      - name: Exercise the minimum pySigma on 3.11 and newest compatible release on 3.14
+        if: matrix.python-version == '3.11' || matrix.python-version == '3.14'
+        run: |
+          if [ "${{ matrix.python-version }}" = '3.11' ]; then
+            poetry run pip install 'pysigma==2.1.0'
+          else
+            poetry run pip install --upgrade 'pysigma>=2.1.0,<3'
+          fi
       - name: Build minimum supported SQLite
         if: matrix.python-version == '3.11'
         run: |
-          curl --fail --location https://www.sqlite.org/2022/$SQLITE_MIN.zip --output /tmp/sqlite-min.zip
+          curl --fail --location "https://www.sqlite.org/2022/${SQLITE_MIN}.zip" --output /tmp/sqlite-min.zip
           unzip -q /tmp/sqlite-min.zip -d /tmp
-          cc -O2 -DSQLITE_THREADSAFE=0 /tmp/$SQLITE_MIN/shell.c /tmp/$SQLITE_MIN/sqlite3.c -lm -ldl -o /tmp/sqlite-min
+          cc -O2 -DSQLITE_THREADSAFE=0 "/tmp/$SQLITE_MIN/shell.c" "/tmp/$SQLITE_MIN/sqlite3.c" -lm -ldl -o /tmp/sqlite-min
           echo "SQLITE_MIN_BINARY=/tmp/sqlite-min" >> "$GITHUB_ENV"
+          mkdir /tmp/sqlite-min-runtime
+          cc -O2 -fPIC -shared "/tmp/$SQLITE_MIN/sqlite3.c" -lm -ldl -o /tmp/sqlite-min-runtime/libsqlite3.so.0
+      - name: Run the suite on the minimum SQLite runtime
+        if: matrix.python-version == '3.11'
+        run: |
+          export LD_LIBRARY_PATH="/tmp/sqlite-min-runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          poetry run python -c "import sqlite3; assert sqlite3.sqlite_version == '3.38.0', sqlite3.sqlite_version"
+          poetry run pytest -q
       - name: Build current SQLite runtime
         if: matrix.python-version == '3.11'
         run: |
-          curl --fail --location https://www.sqlite.org/2026/$SQLITE_CURRENT.zip --output /tmp/sqlite-current.zip
+          curl --fail --location "https://www.sqlite.org/2026/${SQLITE_CURRENT}.zip" --output /tmp/sqlite-current.zip
           unzip -q /tmp/sqlite-current.zip -d /tmp
           mkdir /tmp/sqlite-current
-          cc -O2 -fPIC -shared /tmp/$SQLITE_CURRENT/sqlite3.c -lm -ldl -o /tmp/sqlite-current/libsqlite3.so.0
+          cc -O2 -fPIC -shared "/tmp/$SQLITE_CURRENT/sqlite3.c" -lm -ldl -o /tmp/sqlite-current/libsqlite3.so.0
           # Keep setup-python's own library path after ours.
           echo "LD_LIBRARY_PATH=/tmp/sqlite-current${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - name: Verify current SQLite runtime
@@ -49,7 +65,7 @@ jobs:
         run: poetry run pytest --cov=sigma --cov-report term --cov-report xml:cov.xml -vv
       - name: Store coverage for badge
         if: ${{ runner.os == 'Linux' }}
-        run: poetry run python print-coverage.py >> $GITHUB_ENV
+        run: poetry run python print-coverage.py >> "$GITHUB_ENV"
       - name: Create coverage badge
         # One job only: concurrent gist updates fail with 409 Conflict.
         if: ${{ github.repository == 'wagga40/pySigma-backend-sqlite' && github.event_name == 'push' && runner.os == 'Linux' && matrix.python-version == '3.14' }}
@@ -67,12 +83,13 @@ jobs:
     strategy:
       matrix:
         profile: [raw, windows-sysmon, windows-audit, linux]
+        cidr: [expanded, exact]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           repository: SigmaHQ/sigma
-          ref: 2e8fd89f82d9104c1b30321a307254ddeea17de2
+          ref: 088855f00b65a19e345b09c1619272b44f92fea4
           path: .corpus
       - uses: actions/setup-python@v5
         with:
@@ -83,9 +100,9 @@ jobs:
       # under windows-audit (fields without a Security 4657 equivalent), so the audit
       # pins 2.0.0.
       - run: pip install --no-deps pysigma-pipeline-sysmon==2.0.0 pysigma-pipeline-windows==2.0.0
-      - run: python tools/audit_corpus.py .corpus --profile ${{ matrix.profile }} --fulltext-field _sigma_fulltext --output corpus-${{ matrix.profile }}.json
+      - run: python tools/audit_corpus.py .corpus --profile ${{ matrix.profile }} --cidr-mode ${{ matrix.cidr }} --fulltext-field _sigma_fulltext --output corpus-${{ matrix.profile }}.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: corpus-${{ matrix.profile }}
+          name: corpus-${{ matrix.profile }}-${{ matrix.cidr }}
           path: corpus-${{ matrix.profile }}.json

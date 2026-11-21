@@ -1,8 +1,8 @@
 [project]
 name = "pySigma-backend-sqlite"
-version = "2.1.2"
+version = "2.2.0"
 requires-python = ">=3.11,<4.0"
-dependencies = ["pysigma>=2.0.3,<3.0"]
+dependencies = ["pysigma>=2.1.0,<3.0"]
 description = "pySigma sqlite backend"
 readme = "README.md"
 authors = [
@@ -17,6 +17,7 @@ packages = [
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
+typing-extensions = "^4.0"
 pytest-cov = "^7.1"
 coverage = "^7.4"
 ruff = "^0.16.10"
