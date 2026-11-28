@@ -1,14 +1,17 @@
 import json
 import re
 import sqlite3
+from string import ascii_lowercase, ascii_uppercase
 
 import pytest
 import yaml
 from helpers import correlation, detection
 from sigma.collection import SigmaCollection
+from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
 from sigma.processing.pipeline import ProcessingPipeline
 
 from sigma.backends.sqlite import runtime, sqliteBackend
+from sigma.backends.sqlite.correlation import quote
 
 
 def compile_docs(docs, **options):
@@ -525,3 +528,250 @@ def test_presence_matches_decoded_names_in_every_json_spelling(field, flag):
         i + 1 for i, d in enumerate(documents) if (field in json.loads(d)) == flag
     ]
     assert found == expected
+
+
+NULL_NAMES = "null-field-names-v1"
+ASCII_FOLD = str.maketrans(ascii_uppercase, ascii_lowercase)
+
+
+def null_entry(selection, *, condition="s"):
+    return entry_for(
+        selection,
+        condition=condition,
+        presence_field="nulls",
+        presence_representation=NULL_NAMES,
+    )
+
+
+# (User column, list of source fields stored as NULL)
+NULL_ROWS = [
+    (None, None),  # 1 absent, nothing null in the source
+    (None, "[]"),  # 2 absent
+    (None, '["User"]'),  # 3 explicit null
+    (None, '["USER"]'),  # 4 explicit null, listed in another case
+    ("", None),  # 5 empty value
+    ("v", None),  # 6 value
+    (None, '["Host"]'),  # 7 absent, another field null
+]
+
+
+@pytest.mark.parametrize(
+    "flag,condition,matched",
+    [
+        (True, "s", [3, 4, 5, 6]),
+        (False, "s", [1, 2, 7]),
+        (True, "not s", [1, 2, 7]),
+        (False, "not s", [3, 4, 5, 6]),
+    ],
+)
+def test_null_presence_distinguishes_absent_null_empty_and_value(
+    flag, condition, matched
+):
+    entry = null_entry({"User|exists": flag}, condition=condition)
+    assert entry["schema_version"] == 5
+    assert entry["required_fields"] == ["User", "nulls"]
+    assert entry["presence"] == [
+        {"table": "logs", "field": "nulls", "representation": NULL_NAMES}
+    ]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(User, nulls)")
+        db.executemany("INSERT INTO logs VALUES(?, ?)", NULL_ROWS)
+        runtime.validate_entry(db, entry)
+        sql = entry["rule"][0].replace("SELECT *", "SELECT rowid")
+        assert [r[0] for r in db.execute(sql)] == matched
+
+
+@pytest.mark.parametrize("field", PRESENCE_NAMES)
+@pytest.mark.parametrize("flag", [True, False])
+def test_null_presence_matches_names_in_any_ascii_case_and_json_spelling(field, flag):
+    entry = null_entry({f"{field}|exists": flag})
+    arrays = [
+        [],
+        [field],
+        ["x", field.upper()],
+        [field.swapcase()],
+        [n for n in PRESENCE_NAMES if n != field],
+    ]
+    documents = [
+        json.dumps(keys, ensure_ascii=ascii, separators=separators)
+        for keys in arrays
+        for ascii in (True, False)
+        for separators in ((",", ":"), (", ", ": "), (" , ", ": "))
+    ]
+    rows = [(None, d) for d in [None, *documents]] + [("v", None), ("", "[]")]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(nulls TEXT)")
+        # The field column is absent until the declared fields are widened.
+        runtime.validate_entry(db, entry)
+        runtime.ensure_fields(db, {"logs": entry["required_fields"]})
+        db.executemany(f"INSERT INTO logs({quote(field)}, nulls) VALUES (?, ?)", rows)
+        sql = entry["rule"][0].replace("SELECT *", "SELECT rowid")
+        found = [rowid for (rowid,) in db.execute(sql)]
+    folded = field.translate(ASCII_FOLD)
+    expected = [
+        i + 1
+        for i, (value, document) in enumerate(rows)
+        if (
+            value is not None
+            or document is not None
+            and folded in {k.translate(ASCII_FOLD) for k in json.loads(document)}
+        )
+        == flag
+    ]
+    assert found == expected
+
+
+def test_null_presence_reads_escape_free_arrays_without_the_json_walk():
+    entry = null_entry({"User|exists": True})
+    walked = []
+
+    def json_extract(document, path):
+        walked.append(document)
+        if document is None:
+            return None
+        items = json.loads(document)
+        index = int(path[2:-1])
+        return items[index] if index < len(items) else None
+
+    escaped = '["\\u0055SER"]'
+    with sqlite3.connect(":memory:") as db:
+        db.create_function("json_extract", 2, json_extract)
+        db.execute("CREATE TABLE logs(User, nulls TEXT)")
+        db.executemany(
+            "INSERT INTO logs VALUES (?, ?)",
+            [
+                (None, '["usr"]'),
+                (None, '["a", "uSeR"]'),
+                (None, escaped),
+                (None, None),
+                ("v", None),
+            ],
+        )
+        sql = entry["rule"][0].replace("SELECT *", "SELECT rowid")
+        assert db.execute(sql).fetchall() == [(2,), (3,), (5,)]
+    assert set(walked) == {escaped, None}
+
+
+@pytest.mark.parametrize(
+    "invalid", [123, b"[]", "{}", '["ok", 5]', "unparsed", '["bad\\u0000key"]']
+)
+def test_null_presence_preflight_before_schema_widening(invalid):
+    base = detection()
+    base["detection"]["s"] = {"any|exists": True}
+    plan = compile_docs(
+        [base, correlation()],
+        presence_field="keys",
+        presence_representation=NULL_NAMES,
+    )[0]["correlation_plan"]
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(keys)")
+        db.executemany("INSERT INTO logs VALUES(?)", [(None,), (invalid,)])
+        with pytest.raises(ValueError, match="presence"):
+            runtime.execute_plan(db, plan)
+        assert [r[1] for r in db.execute("PRAGMA table_info(logs)")] == ["keys"]
+
+
+def test_presence_validation_reads_null_lists_as_empty_only_in_null_mode():
+    item = {"table": "logs", "field": "keys"}
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(keys)")
+        db.executemany("INSERT INTO logs VALUES(?)", [(None,), ('["a"]',)])
+        runtime.validate_presence(db, [{**item, "representation": NULL_NAMES}])
+        with pytest.raises(ValueError, match="expected TEXT"):
+            runtime.validate_presence(
+                db, [{**item, "representation": "field-names-v1"}]
+            )
+        for unknown in ("null-field-names-v2", NULL_NAMES.upper()):
+            with pytest.raises(ValueError, match="Invalid presence requirement"):
+                runtime.validate_presence(db, [{**item, "representation": unknown}])
+        with pytest.raises(ValueError, match="Conflicting presence"):
+            runtime.validate_presence(
+                db,
+                [
+                    {**item, "representation": NULL_NAMES},
+                    {
+                        "table": "LOGS",
+                        "field": "KEYS",
+                        "representation": "field-names-v1",
+                    },
+                ],
+            )
+
+
+def test_presence_representation_follows_pipeline_state():
+    base = detection()
+    base["detection"]["s"] = {"original|exists": True}
+    pipe = ProcessingPipeline.from_yaml("""
+transformations:
+  - type: field_name_mapping
+    mapping:
+      original: mapped.name
+  - type: set_state
+    key: presence_field
+    val: nulls
+  - type: set_state
+    key: presence_representation
+    val: null-field-names-v1
+""")
+    entry = compile_docs(
+        [base, correlation(condition={"gte": 1})],
+        processing_pipeline=pipe,
+        presence_field="keys",
+    )[0]
+    assert (
+        entry["presence"]
+        == entry["correlation_plan"]["presence"]
+        == [{"table": "logs", "field": "nulls", "representation": NULL_NAMES}]
+    )
+    assert entry["correlation_plan"]["required_fields"] == {
+        "logs": ["Host", "mapped.name", "nulls", "timestamp"]
+    }
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE logs(timestamp, Host, nulls)")
+        db.executemany(
+            "INSERT INTO logs VALUES('2024-01-01', ?, ?)",
+            [("a", '["MAPPED.NAME"]'), ("b", None), ("c", '["original"]')],
+        )
+        rows, _ = runtime.execute_plan(db, entry["correlation_plan"])
+        assert [row["event_ids"] for row in rows] == [["0:1"]]
+        assert rows[0]["evidence"][0]["event"] == {
+            "timestamp": "2024-01-01",
+            "Host": "a",
+        }
+
+
+def test_presence_representation_rejects_unknown_values():
+    with pytest.raises(ValueError, match="presence_representation"):
+        sqliteBackend(presence_representation="nulls")
+    base = detection()
+    base["detection"]["s"] = {"x|exists": True}
+    pipe = ProcessingPipeline.from_yaml("""
+transformations:
+  - type: set_state
+    key: presence_representation
+    val: nulls
+""")
+    with pytest.raises(
+        SigmaFeatureNotSupportedByBackendError, match="presence_representation"
+    ):
+        compile_docs([base], processing_pipeline=pipe, presence_field="keys")
+
+
+def test_correlation_rejects_two_presence_representations_for_one_column():
+    first = detection()
+    first["detection"]["s"] = {"x|exists": True}
+    second = detection("b", 2)
+    second["detection"]["s"] = {"y|exists": True}
+    pipe = ProcessingPipeline.from_yaml("""
+transformations:
+  - type: set_state
+    key: presence_representation
+    val: null-field-names-v1
+    rule_conditions:
+      - type: rule_attribute
+        attribute: title
+        value: b
+""")
+    docs = [first, second, correlation("temporal", refs=["a", "b"])]
+    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="representation"):
+        compile_docs(docs, processing_pipeline=pipe, presence_field="keys")

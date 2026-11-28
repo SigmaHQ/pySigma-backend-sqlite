@@ -1,6 +1,6 @@
 [project]
 name = "pySigma-backend-sqlite"
-version = "2.2.0"
+version = "2.3.0"
 requires-python = ">=3.11,<4.0"
 dependencies = ["pysigma>=2.1.0,<3.0"]
 description = "pySigma sqlite backend"

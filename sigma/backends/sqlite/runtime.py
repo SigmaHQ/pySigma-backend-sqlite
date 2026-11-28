@@ -16,7 +16,7 @@ from .correlation import (
     quote,
     restore_text,
 )
-from .strict import PRESENCE_REPRESENTATION
+from .strict import NULL_PRESENCE_REPRESENTATION, PRESENCE_REPRESENTATIONS
 from .strict import register_sqlite_functions as register_sqlite_functions
 
 _NAME = rf"(?:{BARE_NAME}|`(?:[^`]|``)+`)"
@@ -122,9 +122,13 @@ def validate_fulltext(connection, requirements):
 
 
 def validate_presence(connection, requirements):
-    """Check every source row carries a JSON array of mapped field names before widening."""
+    """Check every source row carries a JSON array of mapped field names before widening.
+
+    In null-field-names-v1, a NULL row is an empty list.
+    """
     if not isinstance(requirements, list) or not requirements:
         raise ValueError("Invalid presence requirements")
+    representations = {}
     for item in requirements:
         if (
             not isinstance(item, dict)
@@ -134,10 +138,20 @@ def validate_presence(connection, requirements):
             or not isinstance(item["field"], str)
             or not item["field"]
             or "\x00" in item["field"]
-            or item["representation"] != PRESENCE_REPRESENTATION
+            or item["representation"] not in PRESENCE_REPRESENTATIONS
         ):
             raise ValueError("Invalid presence requirement")
+        name = (_identifier(item["table"]), _identifier(item["field"]))
+        if (
+            representations.setdefault(name, item["representation"])
+            != item["representation"]
+        ):
+            raise ValueError(
+                f"Conflicting presence representations for {item['table']}.{item['field']}"
+            )
+    for item in requirements:
         table, field = item["table"], item["field"]
+        nullable = item["representation"] == NULL_PRESENCE_REPRESENTATION
         try:
             if _identifier(field) not in _columns(connection, table):
                 raise ValueError(
@@ -145,12 +159,17 @@ def validate_presence(connection, requirements):
                 )
             column = quote(field)
             cursor = connection.execute(
-                f"SELECT CASE WHEN typeof({column})='text' THEN {column} END FROM {table}"
+                f"SELECT {column} IS NULL, "
+                f"CASE WHEN typeof({column})='text' THEN {column} END FROM {table}"
             )
             try:
-                for (source,) in cursor:
+                for null, source in cursor:
+                    if null and nullable:
+                        continue
                     if source is None:
-                        raise ValueError("expected TEXT")
+                        raise ValueError(
+                            "expected TEXT" + (" or NULL" if nullable else "")
+                        )
                     keys = json.loads(_result_text(source))
                     if not isinstance(keys, list) or any(
                         not isinstance(key, str) or not key or "\x00" in key

@@ -80,6 +80,7 @@ option produces a warning so you can check which setting took effect.
 | `prefilter_bounds` | `true` | Emit Channel/EventID allow-lists for Zircolite storage. Set to `false` for custom collations or event ID coercions |
 | `text_mode` | `portable` | Use `unicode` for Unicode case folding in detections, grouping and distinct counts |
 | `presence_field` | none | JSON array column listing the flattened fields present in each source event |
+| `presence_representation` | `field-names-v1` | Use `null-field-names-v1` when `presence_field` lists only the fields stored as NULL |
 | `sum_mode` | `portable` | Use `exact` to preserve integer window totals beyond SQLite's signed 64-bit range |
 | `week_mode` | `iso` | ISO week of year (1–53). Use `legacy` for SQLite's Monday-based week 0–53 |
 | `modifier_mode` | `sigma` | `windash` expands every dash position and `re\|startswith`/`re\|endswith` stay within the field. Use `pysigma` for pySigma's own expansion, as in 2.1 |
@@ -189,7 +190,7 @@ searchable text. See [keyword search](https://github.com/wagga40/pySigma-backend
 - **Case folding.** Stock BINARY columns compare literal text case-sensitively. SQLite NOCASE columns or `collate_nocase=True` cover ASCII. Set `text_mode="unicode"` and register the runtime helpers for Unicode equality, wildcards, field comparisons and keywords.
 - **Timestamp parts** use `strftime()` and need ISO-8601 text; a numeric epoch is
   read as a Julian day. ISO week 53 occurs in some years. Only `week_mode="legacy"` can produce week 0.
-- **Field existence.** With `presence_field`, `exists` includes an explicitly null field. The default uses SQL NULL as a proxy for absence.
+- **Field existence.** The default uses SQL NULL as a proxy for absence. With `presence_field`, `exists` also counts an explicitly null field. The column lists every field of the source event, or only the fields stored as NULL with `presence_representation="null-field-names-v1"`. That mode reads the field's own column first and matches listed names ASCII case-insensitively.
 - **Multi-field `value_count`** counts distinct complete tuples in each window. A NULL component excludes that tuple from the count.
 - **Unknown columns.** A query naming a column the table lacks fails to prepare.
   Add missing columns as `NULL` first; see [output format](https://github.com/wagga40/pySigma-backend-sqlite/blob/main/docs/output-format.md).
