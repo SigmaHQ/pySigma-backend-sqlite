@@ -53,7 +53,15 @@ from .correlation import (
     quote,
 )
 from .modifiers import BoundedRegex, SQLiteModifiers
-from .strict import PRESENCE_REPRESENTATION
+from .strict import (
+    NULL_PRESENCE_REPRESENTATION,
+    PRESENCE_REPRESENTATION,
+    PRESENCE_REPRESENTATIONS,
+)
+
+_PRESENCE_REPRESENTATION_ERROR = (
+    f"presence_representation must be {' or '.join(PRESENCE_REPRESENTATIONS)}"
+)
 
 _SQLITE_KEYWORDS = set(
     "ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE AND AS ASC ATTACH AUTOINCREMENT BEFORE BEGIN BETWEEN BY CASCADE CASE CAST CHECK COLLATE COLUMN COMMIT CONFLICT CONSTRAINT CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFAULT DEFERRABLE DEFERRED DELETE DESC DETACH DISTINCT DO DROP EACH ELSE END ESCAPE EXCEPT EXCLUDE EXCLUSIVE EXISTS EXPLAIN FAIL FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GENERATED GLOB GROUP GROUPS HAVING IF IGNORE IMMEDIATE IN INDEX INDEXED INITIALLY INNER INSERT INSTEAD INTERSECT INTO IS ISNULL JOIN KEY LAST LEFT LIKE LIMIT MATCH MATERIALIZED NATURAL NO NOT NOTHING NOTNULL NULL NULLS OF OFFSET ON OR ORDER OTHERS OUTER OVER PARTITION PLAN PRAGMA PRECEDING PRIMARY QUERY RAISE RANGE RECURSIVE REFERENCES REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SAVEPOINT SELECT SET TABLE TEMP TEMPORARY THEN TIES TO TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE UPDATE USING VACUUM VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHOUT".split()
@@ -253,6 +261,7 @@ class sqliteBackend(TextQueryBackend):
     text_mode = "portable"
     sum_mode = "portable"
     presence_field: str | None = None
+    presence_representation = PRESENCE_REPRESENTATION
     fulltext_field: str | None = None
     timestamp_seconds_expression = (
         "ROUND((julianday({field}) - 2440587.5) * 86400000) / 1000.0"
@@ -280,6 +289,7 @@ class sqliteBackend(TextQueryBackend):
             "text_mode",
             "sum_mode",
             "presence_field",
+            "presence_representation",
         }
         for key in options.keys() - configurable:
             close = get_close_matches(key, configurable, n=1, cutoff=0.8)
@@ -312,6 +322,8 @@ class sqliteBackend(TextQueryBackend):
             # Skip the replay of windash and re|startswith/endswith. pySigma's own
             # expansion then stands, as in 2.1 releases of this backend.
             self.backend_processing_pipeline = ProcessingPipeline()
+        if self.presence_representation not in PRESENCE_REPRESENTATIONS:
+            raise ValueError(_PRESENCE_REPRESENTATION_ERROR)
         if self.text_mode not in ("portable", "unicode"):
             raise ValueError("text_mode must be portable or unicode")
         if self.sum_mode not in ("portable", "exact"):
@@ -358,10 +370,18 @@ class sqliteBackend(TextQueryBackend):
             )
         return field
 
+    def resolve_presence_representation(self, processing_state):
+        representation = (processing_state or {}).get(
+            "presence_representation", self.presence_representation
+        )
+        if representation not in PRESENCE_REPRESENTATIONS:
+            raise SigmaFeatureNotSupportedByBackendError(_PRESENCE_REPRESENTATION_ERROR)
+        return representation
+
     def execution_contract(self, states, *, fulltext=False, extra_functions=()):
         """Derive the smallest supported schema for these retained predicates and stages."""
         functions = set(extra_functions)
-        presence = set()
+        presence = {}
         uses_regex = False
         strict = (
             self.text_mode == "unicode"
@@ -377,7 +397,16 @@ class sqliteBackend(TextQueryBackend):
             strict |= getattr(state, "sqlite_strict_regex", False)
             source = getattr(state, "sqlite_presence_source", None)
             if source is not None:
-                presence.add(source)
+                table, field, representation = source
+                if (
+                    presence.setdefault((table, field), representation)
+                    != representation
+                ):
+                    raise SigmaFeatureNotSupportedByBackendError(
+                        f"Presence column {field!r} of {table} is read with both "
+                        f"{PRESENCE_REPRESENTATION} and {NULL_PRESENCE_REPRESENTATION}; "
+                        "use one presence_representation per column"
+                    )
         if uses_regex and (strict or presence or functions - {CIDR_FUNCTION}):
             functions.add("regexp")
         contract = {"version": 3 if fulltext else 2}
@@ -387,12 +416,8 @@ class sqliteBackend(TextQueryBackend):
         if presence:
             contract["version"] = 5
             contract["presence"] = [
-                {
-                    "table": table,
-                    "field": field,
-                    "representation": PRESENCE_REPRESENTATION,
-                }
-                for table, field in sorted(presence)
+                {"table": table, "field": field, "representation": representation}
+                for (table, field), representation in sorted(presence.items())
             ]
         return contract
 
@@ -407,35 +432,56 @@ class sqliteBackend(TextQueryBackend):
         field = self.resolve_presence_field(state.processing_state)
         if field is None:
             return super().convert_condition_field_eq_val_exists(cond, state)
+        representation = self.resolve_presence_representation(state.processing_state)
         table = self.resolve_table(state.processing_state)
-        state.sqlite_presence_source = (table, field)
-        # Read the validated array with scalar functions. Tables elsewhere on the
-        # connection may shadow either of SQLite's JSON virtual tables.
-        source = f"{table}.{quote(field)}"
+        state.sqlite_presence_source = (table, field, representation)
         table_name = (
             (state.processing_state.get("table") or self.table)
             .rsplit(".", 1)[-1]
             .lower()
         )
         alias = "field_names" if table_name == "presence_keys" else "presence_keys"
-        negation = "" if cond.value.exists else "NOT "
+        source = f"{table}.{quote(field)}"
+        if representation == PRESENCE_REPRESENTATION:
+            negation = "" if cond.value.exists else "NOT "
+            return negation + self._presence_lookup(source, alias, cond.field)
+        # The array lists only fields the source carried as null. Every other
+        # present field has a value in its own column.
+        lookup = self._presence_lookup(source, alias, cond.field, nocase=True)
+        column = self.escape_and_quote_field(cond.field)
+        if cond.value.exists:
+            return f"({self.field_exists_expression.format(field=column)} OR {lookup})"
+        # A NULL array lists nothing. COALESCE keeps NOT from turning it into NULL.
+        absent = self.field_not_exists_expression.format(field=column)
+        return f"({absent} AND NOT {self.null_safe_expression.format(expr=lookup)})"
+
+    @staticmethod
+    def _presence_lookup(source, alias, name, nocase=False):
+        """True when the JSON array in source lists name, as BINARY or ASCII NOCASE text."""
+        # Read the validated array with scalar functions. Tables elsewhere on the
+        # connection may shadow either of SQLite's JSON virtual tables.
         walk = (
             f"EXISTS (WITH RECURSIVE {alias}(i, key) AS ("
             f"SELECT 0, json_extract({source}, '$[0]') UNION ALL "
             f"SELECT i+1, json_extract({source}, '$[' || (i+1) || ']') "
             f"FROM {alias} WHERE key IS NOT NULL) "
-            f"SELECT 1 FROM {alias} WHERE key = {literal(cond.field)} COLLATE BINARY)"
+            f"SELECT 1 FROM {alias} WHERE key = {literal(name)} "
+            f"COLLATE {'NOCASE' if nocase else 'BINARY'})"
         )
-        if not set(cond.field) - {" ", ","}:
+        if not set(name) - {" ", ","}:
             # Such a name could span the separator between two elements.
-            return negation + walk
+            return walk
         # Each extraction re-reads the array from its start. Without a backslash,
         # every quote in the validated array delimits an element, so the quoted
         # name occurs exactly when one element equals it.
-        name = literal(json.dumps(cond.field, ensure_ascii=False))
+        haystack, needle = source, literal(json.dumps(name, ensure_ascii=False))
+        if nocase:
+            # Stock lower() folds ASCII only, as NOCASE and SQLite's column-name
+            # resolution do. Folding both sides keeps the two paths in agreement.
+            haystack, needle = f"lower({source})", f"lower({needle})"
         return (
-            f"{negation}(CASE WHEN instr({source}, '\\') = 0 "
-            f"THEN instr({source}, {name}) > 0 ELSE {walk} END)"
+            f"(CASE WHEN instr({source}, '\\') = 0 "
+            f"THEN instr({haystack}, {needle}) > 0 ELSE {walk} END)"
         )
 
     @staticmethod
@@ -513,7 +559,12 @@ class sqliteBackend(TextQueryBackend):
                         presence = self.resolve_presence_field(state.processing_state)
                         if presence is not None:
                             fields.add(presence)
-                            continue
+                            representation = self.resolve_presence_representation(
+                                state.processing_state
+                            )
+                            # Only the null-name list leaves present values to the column.
+                            if representation == PRESENCE_REPRESENTATION:
+                                continue
                     if cond.field:
                         fields.add(cond.field)
                     if isinstance(cond.value, SigmaFieldReference):

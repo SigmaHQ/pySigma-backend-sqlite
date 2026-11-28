@@ -128,6 +128,28 @@ folding. With `connection.text_factory = bytes`, source TEXT values in evidence
 are bytes and alert identifiers are strings. The event query's `SELECT *`
 returns the source table's columns.
 
+To store less, set `presence_representation="null-field-names-v1"` on the
+backend or as processing-pipeline state. The array then lists only the fields
+the source carried with a null value, because every other present field
+already has a non-NULL column. A row ingested with `{"User": null, "a.b": ""}`
+stores `["User"]`. A row without null fields can store `[]` or SQL NULL; this
+representation reads a NULL row as an empty list. `User|exists: true` becomes
+`(User IS NOT NULL OR <User is listed>)` and `User|exists: false` becomes
+`(User IS NULL AND NOT COALESCE(<User is listed>, 0))`, so the entry's
+`required_fields` also names `User`. Listed names match ASCII
+case-insensitively, as SQLite resolves column names, so `["USER"]` satisfies
+`User|exists: true`. The array rules and the `instr` and `json_extract` paths
+above apply; `instr` compares both sides after `lower()`. The requirement names
+the representation.
+
+```json
+{"presence":[{"table":"logs","field":"_nulls","representation":"null-field-names-v1"}]}
+```
+
+The compiler and the runtime reject one column declared with both
+representations. A 2.2.0 runtime rejects these entries with `Invalid presence
+requirement` rather than reading the array as a list of present fields.
+
 ### Measured cost on a disposable table
 
 Five local trials ingested 20,000 rows into fresh databases using Python

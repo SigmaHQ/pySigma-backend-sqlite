@@ -104,3 +104,16 @@ schema 5. Upgrade the executor before distributing those entries. Existing
 flattened event stores need a new presence column populated from their source
 records before they can distinguish missing and explicitly null fields.
 [Consumer contract](output-format.md) · [Support and examples](sigma-conformance.md)
+
+## From 2.2.0 to 2.3.0
+
+Version 2.3.0 changes no default. Regenerated output stays the same unless you
+opt into the new presence representation.
+
+- `presence_representation="null-field-names-v1"`, set on the backend or as
+  processing-pipeline state, makes `presence_field` list only the fields a
+  source event carried as null. A non-NULL column or a listed name satisfies
+  `exists: true`, and listed names match ASCII case-insensitively. Entries
+  using it stay at schema and plan version 5 and name the representation in
+  `presence`. A 2.2.0 executor rejects them, so upgrade the executor before
+  distributing them. [Capturing source presence](output-format.md#capturing-source-presence)

@@ -11,7 +11,10 @@ from itertools import accumulate
 
 from .cidr import register_cidr
 
+# Every field the source event carried, or only those it carried as null.
 PRESENCE_REPRESENTATION = "field-names-v1"
+NULL_PRESENCE_REPRESENTATION = "null-field-names-v1"
+PRESENCE_REPRESENTATIONS = (PRESENCE_REPRESENTATION, NULL_PRESENCE_REPRESENTATION)
 
 
 @lru_cache(maxsize=1024)
