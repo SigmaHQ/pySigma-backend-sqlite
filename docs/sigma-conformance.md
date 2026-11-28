@@ -1,7 +1,7 @@
 # Sigma 2.1 support in the SQLite backend
 
 The table describes the Python backend and the sqlite target in sigma-cli with
-pySigma 2.1.0. Both receive parsed rules. Correlation SQL and the reference
+pySigma 2.1.2. Both receive parsed rules. Correlation SQL and the reference
 executor require SQLite 3.38 or later with JSON functions. [Sigma specification](https://github.com/SigmaHQ/sigma-specification/releases/tag/v2.1.0)
 
 | Rule or input | Setting and runtime | Behavior |
@@ -27,7 +27,7 @@ detection item whose original value was discarded cannot be reconstructed.
 
 ## Inputs affected by pySigma parsing
 
-The following limits are present in pySigma 2.1.0. The parser fixtures exercise
+The following limits are present in pySigma 2.1.2. The parser fixtures exercise
 the same inputs against the installed dependency. [Compatibility tests](../tests/test_pysigma_compatibility.py)
 
 | Published input | Parser behavior | Working input or dependency change |

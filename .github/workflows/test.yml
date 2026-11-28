@@ -30,9 +30,9 @@ jobs:
         if: matrix.python-version == '3.11' || matrix.python-version == '3.14'
         run: |
           if [ "${{ matrix.python-version }}" = '3.11' ]; then
-            poetry run pip install 'pysigma==2.1.0'
+            poetry run pip install 'pysigma==2.1.2'
           else
-            poetry run pip install --upgrade 'pysigma>=2.1.0,<3'
+            poetry run pip install --upgrade 'pysigma>=2.1.2,<3'
           fi
       - name: Build minimum supported SQLite
         if: matrix.python-version == '3.11'

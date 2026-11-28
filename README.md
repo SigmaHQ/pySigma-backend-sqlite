@@ -17,7 +17,7 @@ Maintained by [wagga](https://github.com/wagga40/).
 pip install pysigma-backend-sqlite
 ```
 
-Requires Python 3.11+ and [pySigma](https://github.com/SigmaHQ/pySigma) 2.1.0 or
+Requires Python 3.11+ and [pySigma](https://github.com/SigmaHQ/pySigma) 2.1.2 or
 newer within the 2.x series. Correlation output needs SQLite 3.38 or newer. Use sigma-cli 4.0 or newer:
 sigma-cli 3.x requires pySigma 1.x, so alongside it pip installs backend 2.0.0,
 which has no keyword search.
