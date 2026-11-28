@@ -108,7 +108,9 @@ records before they can distinguish missing and explicitly null fields.
 ## From 2.2.0 to 2.3.0
 
 Version 2.3.0 changes no default. Regenerated output stays the same unless you
-opt into the new presence representation.
+opt into the new presence representation. It requires pySigma 2.1.2 through the
+latest 2.x: pySigma 2.1.1 and 2.1.2 fix Jinja sandbox escapes in template
+transformations and a ReDoS in `sigma.matching`.
 
 - `presence_representation="null-field-names-v1"`, set on the backend or as
   processing-pipeline state, makes `presence_field` list only the fields a
